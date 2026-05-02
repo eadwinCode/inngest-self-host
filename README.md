@@ -88,8 +88,13 @@ Follow our [Next.js](https://www.inngest.com/docs/getting-started/nextjs-quick-s
 - **Go** ([inngestgo](https://github.com/inngest/inngestgo)) - [Reference](https://pkg.go.dev/github.com/inngest/inngestgo)
 - **Kotlin / Java** ([inngest-kt](https://github.com/inngest/inngest-kt))
 
-## Self-Hosted Login 
+## Self-Hosted Login
+
+Secure your self-hosted Inngest dashboard with optional password-based authentication. Set `INNGEST_HOST_EMAIL` and `INNGEST_HOST_PASSWORD` environment variables to enable a login screen that protects the web UI and GraphQL API. When these variables are not set, the dashboard remains open as before. SDK endpoints (event ingestion, function registration) are unaffected and continue to use signing key authentication.
+
 <img width="1713" height="950" alt="inngest-host" src="https://github.com/user-attachments/assets/021c478d-b824-4956-9aad-c84bcea8732d" />
+
+[Read more &rarr;](docs/auth/README.md)
 
 
 ## Project Architecture
