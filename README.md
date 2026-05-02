@@ -88,6 +88,10 @@ Follow our [Next.js](https://www.inngest.com/docs/getting-started/nextjs-quick-s
 - **Go** ([inngestgo](https://github.com/inngest/inngestgo)) - [Reference](https://pkg.go.dev/github.com/inngest/inngestgo)
 - **Kotlin / Java** ([inngest-kt](https://github.com/inngest/inngest-kt))
 
+## Self-Hosted Login 
+<img width="1713" height="950" alt="inngest-host" src="https://github.com/user-attachments/assets/021c478d-b824-4956-9aad-c84bcea8732d" />
+
+
 ## Project Architecture
 
 To understand how self-hosting works, it's valuable to understand the architecture and system components at a high level. We'll take a look at a simplified architecture diagram and walk through the system.
