@@ -39,14 +39,7 @@ func HostAuthLoginHandler(config *HostAuthConfig) http.HandlerFunc {
 			return
 		}
 
-		http.SetCookie(w, &http.Cookie{
-			Name:     hostAuthCookieName,
-			Value:    token,
-			Path:     "/",
-			HttpOnly: true,
-			SameSite: http.SameSiteLaxMode,
-			MaxAge:   int(hostAuthExpiry.Seconds()),
-		})
+		http.SetCookie(w, sessionCookie(r, token, int(hostAuthExpiry.Seconds())))
 
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}
@@ -54,14 +47,7 @@ func HostAuthLoginHandler(config *HostAuthConfig) http.HandlerFunc {
 
 func HostAuthLogoutHandler(config *HostAuthConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{
-			Name:     hostAuthCookieName,
-			Value:    "",
-			Path:     "/",
-			HttpOnly: true,
-			SameSite: http.SameSiteLaxMode,
-			MaxAge:   -1,
-		})
+		http.SetCookie(w, sessionCookie(r, "", -1))
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}
 }
@@ -82,6 +68,25 @@ func HostAuthStatusHandler(config *HostAuthConfig) http.HandlerFunc {
 		}
 
 		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
+func isSecureRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return r.Header.Get("X-Forwarded-Proto") == "https"
+}
+
+func sessionCookie(r *http.Request, value string, maxAge int) *http.Cookie {
+	return &http.Cookie{
+		Name:     hostAuthCookieName,
+		Value:    value,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   isSecureRequest(r),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   maxAge,
 	}
 }
 

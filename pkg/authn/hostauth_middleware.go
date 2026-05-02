@@ -2,7 +2,18 @@ package authn
 
 import (
 	"net/http"
+	"net/url"
 )
+
+// SameHostOriginFunc only allows origins that match the request's Host header.
+// This prevents cross-origin credentialed requests from arbitrary websites.
+func SameHostOriginFunc(r *http.Request, origin string) bool {
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return parsed.Host == r.Host
+}
 
 func HostAuthMiddleware(config *HostAuthConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

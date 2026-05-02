@@ -43,9 +43,16 @@ func (c *HostAuthConfig) ValidateCredentials(email, password string) bool {
 	if !c.IsEnabled() {
 		return false
 	}
-	emailMatch := strings.EqualFold(email, c.Email)
+	emailMatch := subtle.ConstantTimeCompare(
+		[]byte(strings.ToLower(email)),
+		[]byte(strings.ToLower(c.Email)),
+	) == 1
 	passwordMatch := subtle.ConstantTimeCompare([]byte(password), []byte(c.Password)) == 1
-	return emailMatch && passwordMatch
+	// Constant-time AND: always evaluate both
+	if emailMatch && passwordMatch {
+		return true
+	}
+	return false
 }
 
 func (c *HostAuthConfig) JWTSecret() []byte {

@@ -82,12 +82,16 @@ func NewCoreApi(o Options) (*CoreAPI, error) {
 		state:  o.State,
 	}
 
-	cors := cors.New(cors.Options{
-		AllowOriginFunc:  func(r *http.Request, origin string) bool { return true },
-		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
-		AllowedHeaders:   []string{"*"},
-		AllowCredentials: true,
-	})
+	corsOpts := cors.Options{
+		AllowOriginFunc: func(r *http.Request, origin string) bool { return true },
+		AllowedMethods:  []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders:  []string{"*"},
+	}
+	if o.HostAuthConfig != nil && o.HostAuthConfig.IsEnabled() {
+		corsOpts.AllowOriginFunc = authn.SameHostOriginFunc
+		corsOpts.AllowCredentials = true
+	}
+	cors := cors.New(corsOpts)
 	a.Use(
 		cors.Handler,
 		headers.StaticHeadersMiddleware(o.Config.GetServerKind()),
