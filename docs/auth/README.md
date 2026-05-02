@@ -6,13 +6,16 @@ Optional password-based authentication for the Inngest self-hosted dashboard. Wh
 
 ## Quick Start
 
-Set two environment variables and restart the server:
+Pull the image and run with two environment variables:
 
 ```bash
-export INNGEST_HOST_EMAIL="admin@yourcompany.com"
-export INNGEST_HOST_PASSWORD="your-secure-password"
+docker pull ghcr.io/eadwincode/inngest-self-host:latest
 
-inngest start \
+docker run -p 8288:8288 \
+  -e INNGEST_HOST_EMAIL="admin@yourcompany.com" \
+  -e INNGEST_HOST_PASSWORD="your-secure-password" \
+  ghcr.io/eadwincode/inngest-self-host:latest \
+  inngest start \
   --signing-key=<your-signing-key> \
   --event-key=<your-event-key> \
   --sqlite-dir=/data/inngest
@@ -43,7 +46,7 @@ Visit `http://localhost:8288` and you'll be redirected to the login page.
 ```yaml
 services:
   inngest:
-    image: inngest/inngest:latest
+    image: ghcr.io/eadwincode/inngest-self-host:latest
     ports:
       - "8288:8288"
     environment:
@@ -60,6 +63,13 @@ services:
 volumes:
   inngest-data:
 ```
+
+### Available Tags
+
+| Tag | Description |
+|---|---|
+| `latest` | Most recent release |
+| `<version>-self-host` | Specific version (e.g. `0.1.0-self-host`) |
 
 ## API Endpoints
 
