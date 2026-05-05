@@ -11,7 +11,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     -ldflags="-s -w -X github.com/inngest/inngest/pkg/inngest/version.Version=${VERSION}" \
     -o /go/bin/inngest ./cmd/
 
-FROM alpine:3.16 AS inngest
+FROM alpine:3.21 AS inngest
 RUN apk add --no-cache ca-certificates tzdata && update-ca-certificates
 COPY --from=build /go/bin/inngest /bin/inngest
 CMD ["inngest"]
