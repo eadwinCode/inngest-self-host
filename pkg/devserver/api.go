@@ -86,10 +86,14 @@ func (a *devapi) addRoutes(AuthMiddleware func(http.Handler) http.Handler, hostA
 
 	a.Post("/dev/traces", a.OTLPTrace) // Intentionally outside the AuthMiddleware
 
+	// /dev info endpoint: accessible via signing key (SDKs) or host auth cookie (browser)
+	a.Group(func(r chi.Router) {
+		r.Use(authn.SigningKeyOrHostAuthMiddleware(AuthMiddleware, hostAuthConfig))
+		r.Get("/dev", a.Info)
+	})
+
 	a.Group(func(r chi.Router) {
 		r.Use(AuthMiddleware)
-
-		r.Get("/dev", a.Info)
 
 		r.Post("/fn/register", a.Register)
 		// This allows tests to remove apps by URL
@@ -148,12 +152,6 @@ func (a devapi) UI(w http.ResponseWriter, r *http.Request) {
 
 // Info returns information about the dev server and its registered functions.
 func (a devapi) Info(w http.ResponseWriter, r *http.Request) {
-	// Return 404 in self-hosted mode
-	if a.devserver.Opts.Config.ServerKind == "cloud" {
-		http.NotFound(w, r)
-		return
-	}
-
 	a.devserver.handlerLock.Lock()
 	defer a.devserver.handlerLock.Unlock()
 
