@@ -86,14 +86,10 @@ func (a *devapi) addRoutes(AuthMiddleware func(http.Handler) http.Handler, hostA
 
 	a.Post("/dev/traces", a.OTLPTrace) // Intentionally outside the AuthMiddleware
 
-	// /dev info endpoint: accessible via signing key (SDKs) or host auth cookie (browser)
-	a.Group(func(r chi.Router) {
-		r.Use(authn.SigningKeyOrHostAuthMiddleware(AuthMiddleware, hostAuthConfig))
-		r.Get("/dev", a.Info)
-	})
-
 	a.Group(func(r chi.Router) {
 		r.Use(AuthMiddleware)
+
+		r.Get("/dev", a.Info)
 
 		r.Post("/fn/register", a.Register)
 		// This allows tests to remove apps by URL
