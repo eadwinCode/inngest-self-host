@@ -36,6 +36,7 @@ import (
 	"github.com/inngest/inngest/pkg/coreapi"
 	"github.com/inngest/inngest/pkg/cqrs"
 	"github.com/inngest/inngest/pkg/cqrs/base_cqrs"
+	cqrsmanager "github.com/inngest/inngest/pkg/cqrs/manager"
 	dbpkg "github.com/inngest/inngest/pkg/db"
 	"github.com/inngest/inngest/pkg/db/driverhelp"
 	dbpostgres "github.com/inngest/inngest/pkg/db/postgres"
@@ -90,7 +91,7 @@ const (
 	DefaultPollInterval = 5
 	DefaultQueueWorkers = 100
 
-	DefaultConnectGatewayPort      = 8289
+	DefaultConnectGatewayPort      = connect.DefaultGatewayPort
 	DefaultConnectGatewayGRPCPort  = 50052
 	DefaultConnectExecutorGRPCPort = 50053
 
@@ -182,18 +183,11 @@ func start(ctx context.Context, opts StartOpts) error {
 
 	services := []service.Service{}
 
-	db, err := base_cqrs.New(ctx, base_cqrs.BaseCQRSOptions{
-		Persist:     opts.Persist,
-		PostgresURI: opts.PostgresURI,
-		Directory:   opts.SQLiteDir,
-	})
-	if err != nil {
-		return err
-	}
-
 	if opts.Tick == 0 {
 		opts.Tick = DefaultTickDuration
 	}
+
+	var err error
 
 	// Initialize the devserver
 	var adapter interface {
@@ -201,11 +195,22 @@ func start(ctx context.Context, opts StartOpts) error {
 		Helpers() driverhelp.DialectHelpers
 	}
 	if opts.PostgresURI != "" {
+		db, err := dbpostgres.Open(ctx, dbpostgres.Options{URI: opts.PostgresURI})
+		if err != nil {
+			return err
+		}
 		adapter = dbpostgres.New(db)
 	} else {
+		db, err := dbsqlite.Open(ctx, dbsqlite.Options{
+			Persist:   opts.Persist,
+			Directory: opts.SQLiteDir,
+		})
+		if err != nil {
+			return err
+		}
 		adapter = dbsqlite.New(db)
 	}
-	dbcqrs := base_cqrs.NewCQRS(adapter)
+	dbcqrs := cqrsmanager.New(adapter)
 	hd := base_cqrs.NewHistoryDriver(adapter)
 	loader := dbcqrs.(state.FunctionLoader)
 
@@ -403,7 +408,10 @@ func start(ctx context.Context, opts StartOpts) error {
 	// to enable zero-downtime migration between Redis clusters via
 	// batch.NewMigratingBatchManager.
 	batcher := batch.NewRedisBatchManager(shardedClient.Batch(), rq, batch.WithLogger(l))
-	debouncer := debounce.NewRedisDebouncer(unshardedClient.Debounce(), queueShard, rq)
+	debouncer, err := debounce.NewDebouncer(shardRegistry, queueShard.Name(), rq)
+	if err != nil {
+		return fmt.Errorf("could not create debounce manager: %w", err)
+	}
 	croner := cron.NewManager(queueShard, rq, l)
 
 	sn := singleton.New(ctx, shardRegistry)
@@ -705,6 +713,8 @@ func start(ctx context.Context, opts StartOpts) error {
 		SigningKeysProvider: apiv2.NewSigningKeysProvider(opts.SigningKey),
 		EventKeysProvider:   apiv2.NewEventKeysProvider(opts.EventKeys),
 		Functions:           NewFunctionProvider(dbcqrs),
+		FunctionRuns:        NewFunctionRunReader(dbcqrs),
+		FunctionTraces:      NewFunctionTraceReader(dbcqrs),
 		Executor:            exec,
 		EventPublisher:      runner,
 	}

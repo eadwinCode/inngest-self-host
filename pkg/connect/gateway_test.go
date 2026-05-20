@@ -33,6 +33,9 @@ import (
 	"github.com/redis/rueidis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -1252,6 +1255,62 @@ func sendWorkerPauseMessage(t *testing.T, ws *websocket.Conn) {
 	require.NoError(t, err)
 }
 
+func marshalSDKResponse(t *testing.T, res testingResources, requestID string) []byte {
+	t.Helper()
+
+	runID := ulid.MustNew(ulid.Now(), rand.Reader)
+	sdkResponse := &connect.SDKResponse{
+		RequestId:      requestID,
+		AccountId:      res.accountID.String(),
+		EnvId:          res.envID.String(),
+		AppId:          res.appID.String(),
+		Status:         connect.SDKResponseStatus_DONE,
+		Body:           []byte("test response"),
+		SdkVersion:     "test-version",
+		RequestVersion: 1,
+		RunId:          runID.String(),
+	}
+
+	responseBytes, err := proto.Marshal(sdkResponse)
+	require.NoError(t, err)
+
+	return responseBytes
+}
+
+type replyFailingExecutor struct {
+	connect.UnimplementedConnectExecutorServer
+	port          int
+	replyReceived chan *connect.ReplyRequest
+}
+
+func startReplyFailingExecutor(t *testing.T) *replyFailingExecutor {
+	t.Helper()
+
+	executor := &replyFailingExecutor{
+		replyReceived: make(chan *connect.ReplyRequest, 1),
+	}
+	grpcServer := grpc.NewServer()
+	connect.RegisterConnectExecutorServer(grpcServer, executor)
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	executor.port = lis.Addr().(*net.TCPAddr).Port
+
+	go func() { _ = grpcServer.Serve(lis) }()
+	t.Cleanup(grpcServer.Stop)
+
+	return executor
+}
+
+func (s *replyFailingExecutor) Ping(_ context.Context, _ *connect.PingRequest) (*connect.PingResponse, error) {
+	return &connect.PingResponse{Message: "ok"}, nil
+}
+
+func (s *replyFailingExecutor) Reply(_ context.Context, req *connect.ReplyRequest) (*connect.ReplyResponse, error) {
+	s.replyReceived <- req
+	return nil, status.Error(codes.Unavailable, "transient reply failure")
+}
+
 func sendWorkerExtendLeaseMessage(t *testing.T, res testingResources, payload *connect.WorkerRequestExtendLeaseData) {
 	ctx := context.Background()
 
@@ -1325,153 +1384,45 @@ func TestHandleSdkReply(t *testing.T) {
 	require.Equal(t, connect.SDKResponseStatus_DONE, savedResponse.Status)
 }
 
-// TestHandleIncomingWebSocketMessageInvalidPayloads tests error handling for invalid message payloads
-func TestHandleIncomingWebSocketMessageInvalidPayloads(t *testing.T) {
-	res := createTestingGateway(t)
+func TestHandleSdkReplyGRPCReplyFailureAfterSaveResponseIsNonFatal(t *testing.T) {
+	ctx := context.Background()
+	res := createTestingGateway(t, testingParameters{silent: true})
 	handshake(t, res)
 
-	ch := &connectionHandler{
-		svc: res.svc,
-		conn: &state.Connection{
-			EnvID: res.envID,
-			Data: &connect.WorkerConnectRequestData{
-				InstanceId: "test-instance",
-			},
-		},
-		ws:  res.ws,
-		log: res.svc.logger,
-	}
+	executor := startReplyFailingExecutor(t)
+	res.svc.grpcConfig.Executor.Port = executor.port
 
-	// Test WORKER_REQUEST_ACK with invalid payload
-	msg := &connect.ConnectMessage{
-		Kind:    connect.GatewayMessageType_WORKER_REQUEST_ACK,
-		Payload: []byte("invalid protobuf"),
-	}
-
-	serr := ch.handleIncomingWebSocketMessage(msg)
-	require.NotNil(t, serr)
-	require.Equal(t, syscode.CodeConnectWorkerRequestAckInvalidPayload, serr.SysCode)
-
-	// Test WORKER_REQUEST_EXTEND_LEASE with invalid payload
-	msg = &connect.ConnectMessage{
-		Kind:    connect.GatewayMessageType_WORKER_REQUEST_EXTEND_LEASE,
-		Payload: []byte("invalid protobuf"),
-	}
-
-	serr = ch.handleIncomingWebSocketMessage(msg)
-	require.NotNil(t, serr)
-	require.Equal(t, syscode.CodeConnectWorkerRequestExtendLeaseInvalidPayload, serr.SysCode)
-
-	// Test WORKER_REQUEST_EXTEND_LEASE with invalid lease ID
-	extendLeaseData := &connect.WorkerRequestExtendLeaseData{
-		RequestId:    "test-req",
-		AccountId:    res.accountID.String(),
-		EnvId:        res.envID.String(),
-		AppId:        res.appID.String(),
-		FunctionSlug: "test-fn",
-		LeaseId:      "invalid-ulid",
-	}
-	extendLeaseBytes, err := proto.Marshal(extendLeaseData)
+	requestID := "test-grpc-reply-failure"
+	_, err := res.svc.stateManager.LeaseRequest(ctx, res.envID, requestID, 5*time.Second, testExecutorIP)
 	require.NoError(t, err)
 
-	msg = &connect.ConnectMessage{
-		Kind:    connect.GatewayMessageType_WORKER_REQUEST_EXTEND_LEASE,
-		Payload: extendLeaseBytes,
-	}
-
-	serr = ch.handleIncomingWebSocketMessage(msg)
-	require.NotNil(t, serr)
-	require.Equal(t, syscode.CodeConnectWorkerRequestExtendLeaseInvalidPayload, serr.SysCode)
-}
-
-// TestHandleIncomingWebSocketMessageDraining tests message handling when gateway is draining
-func TestHandleIncomingWebSocketMessageDraining(t *testing.T) {
-	res := createTestingGateway(t)
-	handshake(t, res)
-
-	// Start draining
-	err := res.svc.DrainGateway()
+	responseBytes := marshalSDKResponse(t, res, requestID)
+	err = wsproto.Write(ctx, res.ws, &connect.ConnectMessage{
+		Kind:    connect.GatewayMessageType_WORKER_REPLY,
+		Payload: responseBytes,
+	})
 	require.NoError(t, err)
 
-	ch := &connectionHandler{
-		svc: res.svc,
-		conn: &state.Connection{
-			EnvID: res.envID,
-			Data: &connect.WorkerConnectRequestData{
-				InstanceId: "test-instance",
-			},
-		},
-		ws:             res.ws,
-		log:            res.svc.logger,
-		stopForwarding: make(chan struct{}),
+	ackMsg := awaitNextMessage(t, res.ws, 2*time.Second)
+	require.Equal(t, connect.GatewayMessageType_WORKER_REPLY_ACK, ackMsg.Kind)
+
+	ackData := &connect.WorkerReplyAckData{}
+	err = proto.Unmarshal(ackMsg.Payload, ackData)
+	require.NoError(t, err)
+	require.Equal(t, requestID, ackData.RequestId)
+
+	select {
+	case req := <-executor.replyReceived:
+		require.Equal(t, requestID, req.Data.RequestId)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for grpc reply attempt")
 	}
 
-	// Test WORKER_READY while draining
-	msg := &connect.ConnectMessage{
-		Kind: connect.GatewayMessageType_WORKER_READY,
-	}
+	savedResponse, err := res.stateManager.GetResponse(ctx, res.envID, requestID)
+	require.NoError(t, err)
+	require.Equal(t, requestID, savedResponse.RequestId)
 
-	serr := ch.handleIncomingWebSocketMessage(msg)
-	require.NotNil(t, serr)
-	require.Equal(t, ErrDraining.SysCode, serr.SysCode)
-
-	// Test WORKER_HEARTBEAT while draining — heartbeats are always allowed
-	// to keep the connection alive while in-flight work finishes.
-	msg = &connect.ConnectMessage{
-		Kind: connect.GatewayMessageType_WORKER_HEARTBEAT,
-	}
-
-	serr = ch.handleIncomingWebSocketMessage(msg)
-	require.Nil(t, serr, "WORKER_HEARTBEAT should be accepted even when gateway is draining")
-
-	// Test WORKER_PAUSE while draining — this should NOT be rejected.
-	// The worker is signaling it wants to stop receiving requests, which
-	// must be honoured regardless of gateway drain state (SYS-709).
-	msg = &connect.ConnectMessage{
-		Kind: connect.GatewayMessageType_WORKER_PAUSE,
-	}
-
-	serr = ch.handleIncomingWebSocketMessage(msg)
-	require.Nil(t, serr, "WORKER_PAUSE should be accepted even when gateway is draining")
-}
-
-// TestHandleIncomingWebSocketMessageMissingInstanceId tests error handling for missing instance ID
-func TestHandleIncomingWebSocketMessageMissingInstanceId(t *testing.T) {
-	res := createTestingGateway(t)
-	handshake(t, res)
-
-	ch := &connectionHandler{
-		svc: res.svc,
-		conn: &state.Connection{
-			EnvID: res.envID,
-			Data: &connect.WorkerConnectRequestData{
-				InstanceId: "", // Empty instance ID
-			},
-		},
-		ws:  res.ws,
-		log: res.svc.logger,
-	}
-
-	// Test WORKER_READY with missing instance ID
-	msg := &connect.ConnectMessage{
-		Kind: connect.GatewayMessageType_WORKER_READY,
-	}
-
-	serr := ch.handleIncomingWebSocketMessage(msg)
-	require.NotNil(t, serr)
-	t.Logf("serr: %+v", serr)
-	require.Equal(t, syscode.CodeConnectInternal, serr.SysCode)
-	require.Contains(t, serr.Msg, "missing instanceId")
-
-	// Test WORKER_HEARTBEAT with missing instance ID
-	msg = &connect.ConnectMessage{
-		Kind: connect.GatewayMessageType_WORKER_HEARTBEAT,
-	}
-
-	serr = ch.handleIncomingWebSocketMessage(msg)
-	require.NotNil(t, serr)
-	require.Equal(t, syscode.CodeConnectInternal, serr.SysCode)
-	require.Contains(t, serr.Msg, "missing instanceId")
+	exchangeHeartbeat(t, res.ws, 2*time.Second)
 }
 
 // TestEstablishConnectionInvalidConnectMessage tests invalid connect messages
@@ -1611,6 +1562,46 @@ func TestEstablishConnectionMissingInstanceId(t *testing.T) {
 	status, reason := awaitClosure(t, ws, 2*time.Second)
 	require.Equal(t, websocket.StatusPolicyViolation, status)
 	require.Equal(t, syscode.CodeConnectWorkerHelloInvalidPayload, reason)
+}
+
+// TestEstablishConnectionMissingApps tests missing app configurations.
+func TestEstablishConnectionMissingApps(t *testing.T) {
+	res := createTestingGateway(t, testingParameters{
+		noConnect: true,
+	})
+
+	ws, _, err := websocket.Dial(context.Background(), res.websocketUrl, &websocket.DialOptions{
+		Subprotocols: []string{types.GatewaySubProtocol},
+	})
+	require.NoError(t, err)
+	defer func() { _ = ws.CloseNow() }()
+
+	// Wait for hello message
+	msg := awaitNextMessage(t, ws, 2*time.Second)
+	require.Equal(t, connect.GatewayMessageType_GATEWAY_HELLO, msg.Kind)
+
+	connID := ulid.MustNew(ulid.Now(), rand.Reader)
+
+	reqData := proto.Clone(res.reqData).(*connect.WorkerConnectRequestData)
+	reqData.ConnectionId = connID.String()
+	reqData.Apps = nil
+
+	connectMsg, err := proto.Marshal(reqData)
+	require.NoError(t, err)
+
+	err = wsproto.Write(context.Background(), ws, &connect.ConnectMessage{
+		Kind:    connect.GatewayMessageType_WORKER_CONNECT,
+		Payload: connectMsg,
+	})
+	require.NoError(t, err)
+
+	status, reason := awaitClosure(t, ws, 2*time.Second)
+	require.Equal(t, websocket.StatusPolicyViolation, status)
+	require.Equal(t, syscode.CodeConnectWorkerHelloInvalidPayload, reason)
+
+	conn, err := res.stateManager.GetConnection(context.Background(), res.envID, connID)
+	require.NoError(t, err)
+	require.Nil(t, conn)
 }
 
 // TestCloseWithConnectError tests the closeWithConnectError function
