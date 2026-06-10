@@ -28,6 +28,13 @@
       }
     }
   },
+  "/apps/{appId}/functions/{functionId}": {
+    "get": {
+      "200": {
+        "// TODO": "Add example data for get /apps/{appId}/functions/{functionId} 200"
+      }
+    }
+  },
   "/apps/{appId}/functions/{functionId}/invoke": {
     "post": {
       "201": {
@@ -259,6 +266,13 @@
       },
       "500": {
         "// TODO": "Add example data for patch /envs/{id} 500"
+      }
+    }
+  },
+  "/events/{eventId}/runs": {
+    "get": {
+      "200": {
+        "// TODO": "Add example data for get /events/{eventId}/runs 200"
       }
     }
   },

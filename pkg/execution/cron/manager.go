@@ -36,8 +36,19 @@ type managerOpt struct {
 	jitterMin time.Duration
 	jitterMax time.Duration
 
+	// productionWorkspaceJitter range is used for production workspace cron
+	// items. If unset, it defaults to the standard jitter range.
+	productionWorkspaceJitterMin time.Duration
+	productionWorkspaceJitterMax time.Duration
+	productionWorkspaceJitterSet bool
+
 	healthCheckLeadTimeSeconds int
 	healthCheckInterval        time.Duration
+
+	// splitCronPartitionByWorkspace, when non-nil and returning true for a
+	// given accountID, causes ScheduleNext to enqueue cron jobs to a
+	// workspace-scoped system partition rather than the shared cron partition.
+	splitCronPartitionByWorkspace func(ctx context.Context, accountID uuid.UUID) (enable bool)
 }
 
 func (opts *managerOpt) validate() {
@@ -63,6 +74,19 @@ func WithJitterRange(min time.Duration, max time.Duration) ManagerOpt {
 	}
 }
 
+func WithProductionWorkspaceJitterRange(min time.Duration, max time.Duration) ManagerOpt {
+	return func(c *managerOpt) {
+		if min > max {
+			logger.StdlibLogger(context.Background()).Warn("rejecting invalid production workspace jitter range in managerOpt", "min", min, "max", max)
+			return
+		}
+
+		c.productionWorkspaceJitterMin = min
+		c.productionWorkspaceJitterMax = max
+		c.productionWorkspaceJitterSet = true
+	}
+}
+
 func WithHealthCheckInterval(d time.Duration) ManagerOpt {
 	return func(c *managerOpt) {
 		if d < time.Minute {
@@ -80,6 +104,15 @@ func WithHealthCheckLeadTimeSeconds(leadTime int) ManagerOpt {
 			return
 		}
 		c.healthCheckLeadTimeSeconds = leadTime
+	}
+}
+
+// WithSplitCronPartitionByWorkspace registers a gate that controls whether
+// cron jobs are enqueued to a workspace-scoped system partition
+// (queue.KindCron:<workspaceID>) instead of the single shared cron partition.
+func WithSplitCronPartitionByWorkspace(fn func(ctx context.Context, accountID uuid.UUID) (enable bool)) ManagerOpt {
+	return func(c *managerOpt) {
+		c.splitCronPartitionByWorkspace = fn
 	}
 }
 
@@ -249,7 +282,7 @@ func (c *manager) EnqueueNextHealthCheck(ctx context.Context) error {
 }
 
 // HealthCheck checks if a "cron" queue item exists system queue for the next expected schedule time
-func (c *manager) HealthCheck(ctx context.Context, functionID uuid.UUID, expr string, fnVersion int) (CronHealthCheckStatus, error) {
+func (c *manager) HealthCheck(ctx context.Context, accountID, envID, functionID uuid.UUID, expr string, fnVersion int) (CronHealthCheckStatus, error) {
 	from := time.Now()
 
 	// Get the next schedule time based on the cron expression
@@ -262,7 +295,11 @@ func (c *manager) HealthCheck(ctx context.Context, functionID uuid.UUID, expr st
 	jobID := queue.HashID(ctx, c.CronProcessJobID(next, expr, functionID, fnVersion))
 
 	// check if the jobID exists in the system queue.
-	exists, err := c.shard.ItemExists(ctx, jobID)
+	exists, err := c.shard.ItemExists(ctx, queue.Scope{
+		AccountID:  accountID,
+		EnvID:      envID,
+		FunctionID: functionID,
+	}, jobID)
 	if err != nil {
 		return CronHealthCheckStatus{}, fmt.Errorf("failed to check if item exits for health check: %w", err)
 	}
@@ -294,25 +331,37 @@ func (c *manager) ScheduleNext(ctx context.Context, ci CronItem) (*CronItem, err
 	// We want only one cron loop to exist for a {FnID, FnVersion, CronExpr} combination. This jobID helps achieve that idempotency.
 	jobID := queue.HashID(ctx, c.CronProcessJobID(next, ci.Expression, ci.FunctionID, ci.FunctionVersion))
 
-	// Add jitter to schedule execution slightly earlier
-	// This ensures execution starts around the desired time
-	jitter := generateJitter(c.opt.jitterMin, c.opt.jitterMax)
+	jitterMin := c.opt.jitterMin
+	jitterMax := c.opt.jitterMax
+	if ci.IsProductionWorkspace && c.opt.productionWorkspaceJitterSet {
+		jitterMin = c.opt.productionWorkspaceJitterMin
+		jitterMax = c.opt.productionWorkspaceJitterMax
+	}
+
+	// Add jitter to schedule execution slightly earlier.
+	// This ensures execution starts around the desired time.
+	jitter := generateJitter(jitterMin, jitterMax)
 	enqueueAt := next.Add(-jitter)
 
 	nextItem := CronItem{
-		ID:              ulid.MustNew(uint64(next.UnixMilli()), rand.Reader),
-		AccountID:       ci.AccountID,
-		WorkspaceID:     ci.WorkspaceID,
-		AppID:           ci.AppID,
-		FunctionID:      ci.FunctionID,
-		FunctionVersion: ci.FunctionVersion,
-		Expression:      ci.Expression,
-		JobID:           jobID,
-		Op:              enums.CronOpProcess,
+		ID:                    ulid.MustNew(uint64(next.UnixMilli()), rand.Reader),
+		AccountID:             ci.AccountID,
+		WorkspaceID:           ci.WorkspaceID,
+		AppID:                 ci.AppID,
+		FunctionID:            ci.FunctionID,
+		FunctionVersion:       ci.FunctionVersion,
+		IsProductionWorkspace: ci.IsProductionWorkspace,
+		Expression:            ci.Expression,
+		JobID:                 jobID,
+		Op:                    enums.CronOpProcess,
 	}
 
 	// enqueue new schedule
 	maxAttempts := consts.MaxRetries + 1
+	queueName := kind
+	if c.opt.splitCronPartitionByWorkspace != nil && c.opt.splitCronPartitionByWorkspace(ctx, ci.AccountID) {
+		queueName = fmt.Sprintf("%s:%s", queue.KindCron, ci.WorkspaceID)
+	}
 
 	err = c.q.Enqueue(ctx, queue.Item{
 		JobID:       &jobID,
@@ -326,7 +375,7 @@ func (c *manager) ScheduleNext(ctx context.Context, ci CronItem) (*CronItem, err
 			WorkflowVersion: ci.FunctionVersion,
 		},
 		Kind:        kind,
-		QueueName:   &kind,
+		QueueName:   &queueName,
 		MaxAttempts: &maxAttempts,
 		Payload:     nextItem,
 	}, enqueueAt, queue.EnqueueOpts{PassthroughJobId: true})

@@ -1293,6 +1293,9 @@ func TestPartitionBacklogSize(t *testing.T) {
 		osqueue.WithAllowKeyQueues(func(ctx context.Context, acctID uuid.UUID, envID, fnID uuid.UUID) bool {
 			return true
 		}),
+		osqueue.WithAccountShardIterationEnabled(func(context.Context, uuid.UUID) bool {
+			return true
+		}),
 		osqueue.WithClock(clock),
 	}
 
@@ -1301,6 +1304,7 @@ func TestPartitionBacklogSize(t *testing.T) {
 	queueShards := mapFromShards(shard1, shard2)
 
 	acctId, fnID, wsID := uuid.New(), uuid.New(), uuid.New()
+	scope := osqueue.Scope{AccountID: acctId, EnvID: wsID, FunctionID: fnID}
 
 	testcases := []struct {
 		name   string
@@ -1384,11 +1388,11 @@ func TestPartitionBacklogSize(t *testing.T) {
 			}
 
 			// NOTE: should return the same result regardless of which shard initiated the instrumentation
-			size1, err := q1.PartitionBacklogSize(ctx, fnID.String())
+			size1, err := q1.PartitionBacklogSize(ctx, scope, fnID.String())
 			require.NoError(t, err)
 			require.EqualValues(t, int64(tc.num), size1)
 
-			size2, err := q2.PartitionBacklogSize(ctx, fnID.String())
+			size2, err := q2.PartitionBacklogSize(ctx, scope, fnID.String())
 			require.NoError(t, err)
 			require.EqualValues(t, int64(tc.num), size2)
 		})

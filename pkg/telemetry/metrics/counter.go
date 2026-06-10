@@ -94,6 +94,15 @@ func IncrQueuePartitionProcessedCounter(ctx context.Context, opts CounterOpt) {
 	})
 }
 
+func IncrQueueDeletedAccountPartitionCounter(ctx context.Context, opts CounterOpt) {
+	RecordCounterMetric(ctx, 1, CounterOpt{
+		PkgName:     opts.PkgName,
+		MetricName:  "queue_deleted_account_partition_total",
+		Description: "The total number of queue partitions found for deleted accounts",
+		Tags:        opts.Tags,
+	})
+}
+
 func IncrPartitionGoneCounter(ctx context.Context, opts CounterOpt) {
 	RecordCounterMetric(ctx, 1, CounterOpt{
 		PkgName:     opts.PkgName,
@@ -135,6 +144,18 @@ func IncrExecutorScheduleCount(ctx context.Context, opts CounterOpt) {
 		PkgName:     opts.PkgName,
 		MetricName:  "executor_scheduled_total",
 		Description: "Total number of executor schedule calls",
+		Tags:        opts.Tags,
+	})
+}
+
+func IncrScheduleFreshStateQueueDuplicateCounter(ctx context.Context, opts CounterOpt) {
+	// This should not happen for Redis state: run-level idempotency is claimed
+	// atomically before state creation, so a duplicate should adopt the
+	// existing run ID instead of creating fresh state.
+	RecordCounterMetric(ctx, 1, CounterOpt{
+		PkgName:     opts.PkgName,
+		MetricName:  "schedule_fresh_state_queue_duplicate_total",
+		Description: "Fresh run states created before queue idempotency rejected the schedule",
 		Tags:        opts.Tags,
 	})
 }

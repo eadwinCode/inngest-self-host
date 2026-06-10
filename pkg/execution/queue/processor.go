@@ -53,11 +53,10 @@ func New(
 
 		QueueOptions: o,
 
-		wg:                       &sync.WaitGroup{},
-		seqLeaseLock:             &sync.RWMutex{},
-		scavengerLeaseLock:       &sync.RWMutex{},
-		instrumentationLeaseLock: &sync.RWMutex{},
-		shardLeaseLock:           &sync.RWMutex{},
+		wg:             &sync.WaitGroup{},
+		roleLeaseLock:  &sync.RWMutex{},
+		roleLeaseIDs:   map[string]*ulid.ULID{},
+		shardLeaseLock: &sync.RWMutex{},
 
 		continuesLock:    &sync.Mutex{},
 		continues:        map[string]continuation{},
@@ -87,6 +86,8 @@ func New(
 			return nil, fmt.Errorf("No shards found for configured shard group: %s", o.runMode.ShardGroup)
 		}
 	}
+
+	qp.configureQueueRoles()
 
 	return qp, nil
 }
@@ -122,12 +123,11 @@ type queueProcessor struct {
 	// prior to leasing items.
 	sem util.TrackingSemaphore
 
-	// seqLeaseID stores the lease ID if this queue is the sequential processor.
-	// all runners attempt to claim this lease automatically.
-	seqLeaseID *ulid.ULID
-	// seqLeaseLock ensures that there are no data races writing to
-	// or reading from seqLeaseID in parallel.
-	seqLeaseLock *sync.RWMutex
+	// roleLeaseIDs stores per-role lease IDs.
+	roleLeaseIDs map[string]*ulid.ULID
+	// roleLeaseLock ensures that there are no data races writing to
+	// or reading from roleLeaseIDs in parallel.
+	roleLeaseLock *sync.RWMutex
 
 	// shardLeaseID stores the lease ID for the primary shard this queue is processing from.
 	// all runners attempt to claim this lease on start up.
@@ -135,13 +135,6 @@ type queueProcessor struct {
 	// shardLeaseLock ensures that there are no data races writing to
 	// or reading from shardLeaseID in parallel.
 	shardLeaseLock *sync.RWMutex
-
-	// instrumentationLeaseID stores the lease ID if executor is running queue
-	// instrumentations
-	instrumentationLeaseID *ulid.ULID
-	// instrumentationLeaseLock ensures that there are no data races writing to or
-	// reading from instrumentationLeaseID
-	instrumentationLeaseLock *sync.RWMutex
 
 	// continues stores a map of all partition IDs to continues for a partition.
 	// this lets us optimize running consecutive steps for a function, as a continuation, to a specific limit.
@@ -153,13 +146,6 @@ type queueProcessor struct {
 
 	// continuesLock protects the continues map.
 	continuesLock *sync.Mutex
-
-	// scavengerLeaseID stores the lease ID if this queue is the scavenger processor.
-	// all runners attempt to claim this lease automatically.
-	scavengerLeaseID *ulid.ULID
-	// scavengerLeaseLock ensures that there are no data races writing to
-	// or reading from scavengerLeaseID in parallel.
-	scavengerLeaseLock *sync.RWMutex
 
 	shadowContinues        map[string]ShadowContinuation
 	shadowContinueCooldown map[string]time.Time
@@ -224,8 +210,8 @@ func (q *queueProcessor) Dequeue(ctx context.Context, shard QueueShard, i QueueI
 }
 
 // ItemExists implements QueueManager.
-func (q *queueProcessor) ItemExists(ctx context.Context, shard QueueShard, jobID string) (bool, error) {
-	return shard.ItemExists(ctx, jobID)
+func (q *queueProcessor) ItemExists(ctx context.Context, shard QueueShard, scope Scope, jobID string) (bool, error) {
+	return shard.ItemExists(ctx, scope, jobID)
 }
 
 // ItemsByBacklog implements QueueManager.
@@ -234,13 +220,13 @@ func (q *queueProcessor) ItemsByBacklog(ctx context.Context, shard QueueShard, b
 }
 
 // ItemsByPartition implements QueueManager.
-func (q *queueProcessor) ItemsByPartition(ctx context.Context, shard QueueShard, partitionID string, from time.Time, until time.Time, opts ...QueueIterOpt) (iter.Seq[*QueueItem], error) {
-	return shard.ItemsByPartition(ctx, partitionID, from, until, opts...)
+func (q *queueProcessor) ItemsByPartition(ctx context.Context, shard QueueShard, scope Scope, partitionID string, from time.Time, until time.Time, opts ...QueueIterOpt) (iter.Seq[*QueueItem], error) {
+	return shard.ItemsByPartition(ctx, scope, partitionID, from, until, opts...)
 }
 
 // ItemsByRunID implements QueueManager.
-func (q *queueProcessor) ItemsByRunID(ctx context.Context, shard QueueShard, runID ulid.ULID) ([]*QueueItem, error) {
-	return shard.ItemsByRunID(ctx, runID)
+func (q *queueProcessor) ItemsByRunID(ctx context.Context, shard QueueShard, scope Scope, runID ulid.ULID) ([]*QueueItem, error) {
+	return shard.ItemsByRunID(ctx, scope, runID)
 }
 
 // LoadQueueItem implements QueueManager.
@@ -253,12 +239,26 @@ func (q *queueProcessor) LoadQueueItem(ctx context.Context, shardName string, it
 	return shard.LoadQueueItem(ctx, itemID)
 }
 
+func (q *queueProcessor) forAccountShards(ctx context.Context, accountID uuid.UUID, fn func(context.Context, QueueShard) error) error {
+	// Fan-out is feature-flagged because querying every shard increases
+	// latency and makes a single shard failure affect the whole read.
+	if q.AccountShardIterationEnabled != nil && q.AccountShardIterationEnabled(ctx, accountID) {
+		return q.shards.ForEach(ctx, fn)
+	}
+
+	shard, err := q.shards.Resolve(ctx, accountID, nil)
+	if err != nil {
+		return fmt.Errorf("could not resolve account shard: %w", err)
+	}
+	return fn(ctx, shard)
+}
+
 // PartitionBacklogSize implements QueueManager.
-func (q *queueProcessor) PartitionBacklogSize(ctx context.Context, partitionID string) (int64, error) {
+func (q *queueProcessor) PartitionBacklogSize(ctx context.Context, scope Scope, partitionID string) (int64, error) {
 	var totalCount int64
 
-	err := q.shards.ForEach(ctx, func(ctx context.Context, shard QueueShard) error {
-		backlogSize, err := shard.PartitionBacklogSize(ctx, partitionID)
+	err := q.forAccountShards(ctx, scope.AccountID, func(ctx context.Context, shard QueueShard) error {
+		backlogSize, err := shard.PartitionBacklogSize(ctx, scope, partitionID)
 		if err != nil {
 			return fmt.Errorf("could not load partition backlog size: %w", err)
 		}
@@ -274,18 +274,18 @@ func (q *queueProcessor) PartitionBacklogSize(ctx context.Context, partitionID s
 }
 
 // PartitionByID implements QueueManager.
-func (q *queueProcessor) PartitionByID(ctx context.Context, shard QueueShard, partitionID string) (*PartitionInspectionResult, error) {
-	return shard.PartitionByID(ctx, partitionID)
+func (q *queueProcessor) PartitionByID(ctx context.Context, shard QueueShard, scope Scope, partitionID string) (*PartitionInspectionResult, error) {
+	return shard.PartitionByID(ctx, scope, partitionID)
 }
 
 // RemoveQueueItem implements QueueManager.
-func (q *queueProcessor) RemoveQueueItem(ctx context.Context, shardName string, partitionID string, itemID string) error {
+func (q *queueProcessor) RemoveQueueItem(ctx context.Context, shardName string, scope Scope, partitionID string, itemID string) error {
 	shard, err := q.shards.ByName(shardName)
 	if err != nil {
 		return err
 	}
 
-	return shard.RemoveQueueItem(ctx, partitionID, itemID)
+	return shard.RemoveQueueItem(ctx, scope, partitionID, itemID)
 }
 
 // Requeue implements QueueManager.
@@ -304,11 +304,11 @@ func (q *queueProcessor) TotalSystemQueueDepth(ctx context.Context, shard QueueS
 }
 
 // OutstandingJobCount implements Queue.
-func (q *queueProcessor) OutstandingJobCount(ctx context.Context, envID uuid.UUID, fnID uuid.UUID, runID ulid.ULID) (int, error) {
+func (q *queueProcessor) OutstandingJobCount(ctx context.Context, scope Scope, runID ulid.ULID) (int, error) {
 	var totalCount int64
 
-	err := q.shards.ForEach(ctx, func(ctx context.Context, shard QueueShard) error {
-		outstanding, err := shard.OutstandingJobCount(ctx, envID, fnID, runID)
+	err := q.forAccountShards(ctx, scope.AccountID, func(ctx context.Context, shard QueueShard) error {
+		outstanding, err := shard.OutstandingJobCount(ctx, scope, runID)
 		if err != nil {
 			return fmt.Errorf("could not load outstanding job count: %w", err)
 		}
@@ -322,21 +322,21 @@ func (q *queueProcessor) OutstandingJobCount(ctx context.Context, envID uuid.UUI
 }
 
 // RunJobs implements Queue.
-func (q *queueProcessor) RunJobs(ctx context.Context, shardName string, workspaceID uuid.UUID, workflowID uuid.UUID, runID ulid.ULID, limit int64, offset int64) ([]JobResponse, error) {
+func (q *queueProcessor) RunJobs(ctx context.Context, shardName string, scope Scope, runID ulid.ULID, limit int64, offset int64) ([]JobResponse, error) {
 	shard, err := q.shards.ByName(shardName)
 	if err != nil {
 		return nil, err
 	}
 
-	return shard.RunJobs(ctx, workspaceID, workflowID, runID, limit, offset)
+	return shard.RunJobs(ctx, scope, runID, limit, offset)
 }
 
 // RunningCount implements Queue.
-func (q *queueProcessor) RunningCount(ctx context.Context, workflowID uuid.UUID) (int64, error) {
+func (q *queueProcessor) RunningCount(ctx context.Context, scope Scope) (int64, error) {
 	var totalCount int64
 
-	err := q.shards.ForEach(ctx, func(ctx context.Context, shard QueueShard) error {
-		running, err := shard.RunningCount(ctx, workflowID)
+	err := q.forAccountShards(ctx, scope.AccountID, func(ctx context.Context, shard QueueShard) error {
+		running, err := shard.RunningCount(ctx, scope)
 		if err != nil {
 			return fmt.Errorf("could not load running count: %w", err)
 		}
@@ -350,11 +350,11 @@ func (q *queueProcessor) RunningCount(ctx context.Context, workflowID uuid.UUID)
 }
 
 // StatusCount implements Queue.
-func (q *queueProcessor) StatusCount(ctx context.Context, workflowID uuid.UUID, status string) (int64, error) {
+func (q *queueProcessor) StatusCount(ctx context.Context, scope Scope, status string) (int64, error) {
 	var totalCount int64
 
-	err := q.shards.ForEach(ctx, func(ctx context.Context, shard QueueShard) error {
-		running, err := shard.StatusCount(ctx, workflowID, status)
+	err := q.forAccountShards(ctx, scope.AccountID, func(ctx context.Context, shard QueueShard) error {
+		running, err := shard.StatusCount(ctx, scope, status)
 		if err != nil {
 			return fmt.Errorf("could not load status count: %w", err)
 		}
@@ -368,13 +368,13 @@ func (q *queueProcessor) StatusCount(ctx context.Context, workflowID uuid.UUID, 
 }
 
 // ResetAttemptsByJobID implements Queue.
-func (q *queueProcessor) ResetAttemptsByJobID(ctx context.Context, shardName string, jobID string) error {
+func (q *queueProcessor) ResetAttemptsByJobID(ctx context.Context, shardName string, scope Scope, jobID string) error {
 	shard, err := q.shards.ByName(shardName)
 	if err != nil {
 		return err
 	}
 
-	return shard.ResetAttemptsByJobID(ctx, jobID)
+	return shard.ResetAttemptsByJobID(ctx, scope, jobID)
 }
 
 func (q *queueProcessor) Run(ctx context.Context, f RunFunc) error {
@@ -389,16 +389,9 @@ func (q *queueProcessor) Run(ctx context.Context, f RunFunc) error {
 		l.Info("Executor started in assignedQueueShard Mode", "queue_shard", q.Shard().Name())
 	}
 
-	if q.runMode.Sequential {
-		go q.claimSequentialLease(ctx)
+	for _, role := range q.roles {
+		go q.runRole(ctx, role)
 	}
-
-	if q.runMode.Scavenger {
-		go q.runScavenger(ctx)
-	}
-
-	go q.runInstrumentation(ctx)
-	go q.runLatencyTracker(ctx)
 
 	wrappedF := q.wrapRunFuncWithLatency(f)
 
@@ -425,22 +418,22 @@ func (q *queueProcessor) Run(ctx context.Context, f RunFunc) error {
 }
 
 // SetFunctionMigrate implements Queue.
-func (q *queueProcessor) SetFunctionMigrate(ctx context.Context, sourceShard string, fnID uuid.UUID, migrateLockUntil *time.Time) error {
+func (q *queueProcessor) SetFunctionMigrate(ctx context.Context, sourceShard string, scope Scope, migrateLockUntil *time.Time) error {
 	shard, err := q.shards.ByName(sourceShard)
 	if err != nil {
 		return fmt.Errorf("could not find shard %q", sourceShard)
 	}
 
-	return shard.SetFunctionMigrate(ctx, fnID, migrateLockUntil)
+	return shard.SetFunctionMigrate(ctx, scope, migrateLockUntil)
 }
 
 // UnpauseFunction implements Queue.
-func (q *queueProcessor) UnpauseFunction(ctx context.Context, shardName string, acctID uuid.UUID, envID, fnID uuid.UUID) error {
+func (q *queueProcessor) UnpauseFunction(ctx context.Context, shardName string, scope Scope) error {
 	shard, err := q.shards.ByName(shardName)
 	if err != nil {
 		return err
 	}
-	return shard.UnpauseFunction(ctx, acctID, envID, fnID)
+	return shard.UnpauseFunction(ctx, scope)
 }
 
 func (q *queueProcessor) capacity() int64 {

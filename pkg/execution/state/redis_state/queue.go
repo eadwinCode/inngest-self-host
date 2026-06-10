@@ -327,12 +327,12 @@ func (q *queue) dropPartitionPointerIfEmpty(ctx context.Context, keyIndex, keyPa
 	}
 }
 
-func (q *queue) SetFunctionMigrate(ctx context.Context, fnID uuid.UUID, migrateLockUntil *time.Time) error {
+func (q *queue) SetFunctionMigrate(ctx context.Context, scope osqueue.Scope, migrateLockUntil *time.Time) error {
 	ctx = redis_telemetry.WithScope(redis_telemetry.WithOpName(ctx, "SetFunctionMigrate"), redis_telemetry.ScopeQueue)
 	client := q.RedisClient.Client()
 	kg := q.RedisClient.KeyGenerator()
 
-	key := kg.QueueMigrationLock(fnID)
+	key := kg.QueueMigrationLock(scope.FunctionID)
 	if migrateLockUntil == nil {
 		cmd := client.B().Del().Key(key).Build()
 		err := client.Do(ctx, cmd).Error()
@@ -357,7 +357,7 @@ func (q *queue) SetFunctionMigrate(ctx context.Context, fnID uuid.UUID, migrateL
 
 // removeQueueItem attempts to remove a specific item in the target queue shard
 // and also remove it from the queue item hash as well
-func (q *queue) RemoveQueueItem(ctx context.Context, partitionID string, itemID string) error {
+func (q *queue) RemoveQueueItem(ctx context.Context, scope osqueue.Scope, partitionID string, itemID string) error {
 	l := logger.StdlibLogger(ctx)
 
 	ctx = redis_telemetry.WithScope(redis_telemetry.WithOpName(ctx, "removeQueueItem"), redis_telemetry.ScopeQueue)
@@ -461,6 +461,7 @@ func (q *queue) Peek(ctx context.Context, partition *osqueue.QueuePartition, unt
 			Until:        until,
 			PartitionKey: partitionKey,
 			PartitionID:  partition.ID,
+			Scope:        osqueue.ScopeFromQueuePartition(partition),
 		},
 	)
 	return result.Items, err
@@ -490,6 +491,7 @@ func (q *queue) PeekRandom(ctx context.Context, partition *osqueue.QueuePartitio
 			Until:        until,
 			PartitionKey: partitionKey,
 			PartitionID:  partition.ID,
+			Scope:        osqueue.ScopeFromQueuePartition(partition),
 			Random:       true,
 		},
 	)
@@ -499,6 +501,7 @@ func (q *queue) PeekRandom(ctx context.Context, partition *osqueue.QueuePartitio
 type peekOpts struct {
 	PartitionID  string
 	PartitionKey string
+	Scope        osqueue.Scope
 	Random       bool
 	From         *time.Time
 	Until        time.Time
@@ -629,7 +632,7 @@ func (q *queue) peek(ctx context.Context, opts peekOpts) (peekResult, error) {
 		for _, missingItemId := range missingQueueItems {
 			id := missingItemId
 			eg.Go(func() error {
-				return q.RemoveQueueItem(ctx, opts.PartitionID, id)
+				return q.RemoveQueueItem(ctx, opts.Scope, opts.PartitionID, id)
 			})
 		}
 
@@ -687,7 +690,7 @@ func (q *queue) peek(ctx context.Context, opts peekOpts) (peekResult, error) {
 	}, nil
 }
 
-func (q *queue) ResetAttemptsByJobID(ctx context.Context, jobID string) error {
+func (q *queue) ResetAttemptsByJobID(ctx context.Context, scope osqueue.Scope, jobID string) error {
 	l := logger.StdlibLogger(ctx)
 
 	ctx = redis_telemetry.WithScope(redis_telemetry.WithOpName(ctx, "ResetAttemptsByJobID"), redis_telemetry.ScopeQueue)
@@ -1146,7 +1149,7 @@ func (q *queue) PartitionPeek(ctx context.Context, sequential bool, until time.T
 	return partitions, nil
 }
 
-func (q *queue) PartitionSize(ctx context.Context, partitionID string, until time.Time) (int64, error) {
+func (q *queue) PartitionSize(ctx context.Context, scope osqueue.Scope, partitionID string, until time.Time) (int64, error) {
 	return q.partitionSize(ctx, q.RedisClient.kg.PartitionQueueSet(enums.PartitionTypeDefault, partitionID, ""), until)
 }
 
@@ -1813,7 +1816,7 @@ func isKeyConcurrencyPointerItem(partition string) bool {
 	return strings.HasPrefix(partition, "{")
 }
 
-// ConfigLease allows a worker to lease config keys for sequential or scavenger processing.
+// RoleLease allows a worker to lease queue roles.
 // Leasing this key works similar to leasing partitions or queue items:
 //
 //   - If the key isn't leased, a new lease is accepted.
@@ -1824,12 +1827,12 @@ func isKeyConcurrencyPointerItem(partition string) bool {
 // This returns the new lease ID on success.
 //
 // If the sequential key is leased, this allows a worker to peek partitions sequentially.
-func (q *queue) ConfigLease(ctx context.Context, key string, duration time.Duration, existingLeaseID ...*ulid.ULID) (*ulid.ULID, error) {
-	if duration > osqueue.ConfigLeaseMax {
-		return nil, osqueue.ErrConfigLeaseExceedsLimits
+func (q *queue) RoleLease(ctx context.Context, key string, duration time.Duration, existingLeaseID ...*ulid.ULID) (*ulid.ULID, error) {
+	if duration > osqueue.RoleLeaseMax {
+		return nil, osqueue.ErrRoleLeaseExceedsLimits
 	}
 
-	ctx = redis_telemetry.WithScope(redis_telemetry.WithOpName(ctx, "ConfigLease"), redis_telemetry.ScopeQueue)
+	ctx = redis_telemetry.WithScope(redis_telemetry.WithOpName(ctx, "RoleLease"), redis_telemetry.ScopeQueue)
 
 	now := q.Clock.Now()
 	newLeaseID, err := ulid.New(ulid.Timestamp(now.Add(duration)), rnd)
@@ -1855,20 +1858,20 @@ func (q *queue) ConfigLease(ctx context.Context, key string, duration time.Durat
 		redis_telemetry.WithScriptName(ctx, "configLease"),
 		q.RedisClient.unshardedRc,
 		[]string{
-			q.RedisClient.kg.ConfigLeaseKey(key),
+			q.RedisClient.kg.RoleLeaseKey(key),
 		},
 		args,
 	).AsInt64()
 	if err != nil {
-		return nil, fmt.Errorf("error claiming config lease: %w", err)
+		return nil, fmt.Errorf("error claiming role lease: %w", err)
 	}
 	switch status {
 	case 0:
 		return &newLeaseID, nil
 	case 1:
-		return nil, osqueue.ErrConfigAlreadyLeased
+		return nil, osqueue.ErrRoleAlreadyLeased
 	default:
-		return nil, fmt.Errorf("unknown response claiming config lease: %d", status)
+		return nil, fmt.Errorf("unknown response claiming role lease: %d", status)
 	}
 }
 

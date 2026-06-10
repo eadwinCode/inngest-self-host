@@ -206,8 +206,6 @@ func (a CoreAPI) TrackEvent(w http.ResponseWriter, r *http.Request) {
 	eventName, ok := requestBody["eventName"].(string)
 	if ok {
 		tel.SendEvent(ctx, eventName, metadata)
-	} else {
-		tel.SendMetadata(ctx, metadata)
 	}
 
 	w.WriteHeader(http.StatusOK)

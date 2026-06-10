@@ -64,10 +64,10 @@ type QueueManager interface {
 
 	// ResetAttemptsByJobID sets retries to zero given a single job ID.  This is important for
 	// checkpointing;  a single job becomes shared amongst many  steps.
-	ResetAttemptsByJobID(ctx context.Context, shard string, jobID string) error
+	ResetAttemptsByJobID(ctx context.Context, shard string, scope Scope, jobID string) error
 
 	// ItemsByPartition returns a queue item iterator for a function within a specific time range
-	ItemsByPartition(ctx context.Context, queueShard QueueShard, partitionID string, from time.Time, until time.Time, opts ...QueueIterOpt) (iter.Seq[*QueueItem], error)
+	ItemsByPartition(ctx context.Context, queueShard QueueShard, scope Scope, partitionID string, from time.Time, until time.Time, opts ...QueueIterOpt) (iter.Seq[*QueueItem], error)
 	// ItemsByBacklog returns a queue item iterator for a backlog within a specific time range
 	ItemsByBacklog(ctx context.Context, queueShard QueueShard, backlogID string, from time.Time, until time.Time, opts ...QueueIterOpt) (iter.Seq[*QueueItem], error)
 	// BacklogsByPartition returns an iterator for the partition's backlogs
@@ -77,21 +77,21 @@ type QueueManager interface {
 	// BacklogByID retrieves a single backlog by its ID
 	BacklogByID(ctx context.Context, queueShard QueueShard, backlogID string) (*QueueBacklog, error)
 	// PartitionByID retrieves the partition by the partition ID
-	PartitionByID(ctx context.Context, queueShard QueueShard, partitionID string) (*PartitionInspectionResult, error)
+	PartitionByID(ctx context.Context, queueShard QueueShard, scope Scope, partitionID string) (*PartitionInspectionResult, error)
 	// LoadQueueItem retrieves the queue item by the item ID.
 	LoadQueueItem(ctx context.Context, shardName string, itemID string) (*QueueItem, error)
 
 	// ItemExists checks if an item with jobID exists in the queue
-	ItemExists(ctx context.Context, queueShard QueueShard, jobID string) (bool, error)
+	ItemExists(ctx context.Context, queueShard QueueShard, scope Scope, jobID string) (bool, error)
 	// ItemsByRunID retrieves all queue items via runID
 	//
 	// NOTE
 	// The queue technically shouldn't know about runIDs, so we should make this more generic with certain type of indices in the future
-	ItemsByRunID(ctx context.Context, queueShard QueueShard, runID ulid.ULID) ([]*QueueItem, error)
+	ItemsByRunID(ctx context.Context, queueShard QueueShard, scope Scope, runID ulid.ULID) ([]*QueueItem, error)
 
 	// PartitionBacklogSize returns the point in time backlog size of the partition.
 	// This will sum the size of all backlogs in that partition
-	PartitionBacklogSize(ctx context.Context, partitionID string) (int64, error)
+	PartitionBacklogSize(ctx context.Context, scope Scope, partitionID string) (int64, error)
 
 	// Total queue depth of all partitions including backlog and ready state items
 	TotalSystemQueueDepth(ctx context.Context, queueShard QueueShard) (int64, error)
@@ -130,7 +130,6 @@ type QueueProcessor interface {
 	Semaphore() util.TrackingSemaphore
 	Options() *QueueOptions
 	Workers() chan ProcessItem
-	SequentialLease() *ulid.ULID
 
 	ShadowPartitionWorkers() chan ShadowPartitionChanMsg
 	AddShadowContinue(ctx context.Context, p *QueueShadowPartition, ctr uint)
@@ -155,14 +154,6 @@ type QueueProcessor interface {
 		item *QueueItem,
 		now time.Time,
 	) (ItemLeaseConstraintCheckResult, error)
-}
-
-// Scope identifies the tenant/function namespace for queue-owned state.
-type Scope struct {
-	IsSystem   bool
-	AccountID  uuid.UUID
-	EnvID      uuid.UUID
-	FunctionID uuid.UUID
 }
 
 // SingletonOperations is the per-shard surface for singleton lock state.
@@ -190,7 +181,8 @@ const (
 	// the debounce; the caller should drop the update.
 	DebounceUpdateOutOfOrder
 	// DebounceUpdateNotFound indicates the timeout queue item is missing;
-	// the caller should enqueue a fresh timeout job.
+	// the caller should enqueue a fresh timeout job. Implementations may
+	// return ttlSeconds when they can preserve the debounce's capped timeout.
 	DebounceUpdateNotFound
 )
 
@@ -226,10 +218,10 @@ type DebounceOperations interface {
 
 	// DebouncePrepareMigration atomically replaces the debounce pointer
 	// with fakeDebounceID to disable execution on this shard, returning
-	// the existing debounce ID and timeout (millis) so the caller can
-	// re-create the debounce on another shard. Returns (nil, 0, nil)
-	// when no debounce exists.
-	DebouncePrepareMigration(ctx context.Context, scope Scope, key string, fakeDebounceID ulid.ULID) (existingID *ulid.ULID, timeoutMillis int64, err error)
+	// the existing debounce ID, timeout (millis), and pointer TTL so the
+	// caller can re-create or restore the debounce on another shard.
+	// Returns (nil, 0, 0, nil) when no debounce exists.
+	DebouncePrepareMigration(ctx context.Context, scope Scope, key string, fakeDebounceID ulid.ULID) (existingID *ulid.ULID, timeoutMillis int64, pointerTTL time.Duration, err error)
 
 	// DebounceGetItem retrieves the serialized debounce item from the
 	// hash. Returns ErrDebounceNotFound when absent.
@@ -246,6 +238,10 @@ type DebounceOperations interface {
 	// DebounceGetPointer reads the current debounce ID for scope/key.
 	// Returns ErrDebounceNotFound when no debounce is active.
 	DebounceGetPointer(ctx context.Context, scope Scope, key string) (string, error)
+
+	// DebounceSetPointer sets the pointer for scope/key, optionally
+	// preserving the previous TTL when ttl is greater than zero.
+	DebounceSetPointer(ctx context.Context, scope Scope, key string, debounceID ulid.ULID, ttl time.Duration) error
 
 	// DebounceDeletePointer removes the pointer for scope/key.
 	DebounceDeletePointer(ctx context.Context, scope Scope, key string) error
@@ -306,15 +302,16 @@ type ShadowProcessingOperations interface {
 // InsightsOperations is the per-shard surface for queue inspection and metrics.
 type InsightsOperations interface {
 	Instrument(ctx context.Context) error
-	ItemsByPartition(ctx context.Context, partitionID string, from time.Time, until time.Time, opts ...QueueIterOpt) (iter.Seq[*QueueItem], error)
+	ItemsByPartition(ctx context.Context, scope Scope, partitionID string, from time.Time, until time.Time, opts ...QueueIterOpt) (iter.Seq[*QueueItem], error)
 
 	// Total queue depth of all partitions including backlog and ready state items
 	TotalSystemQueueDepth(ctx context.Context) (int64, error)
 
-	PartitionBacklogSize(ctx context.Context, partitionID string) (int64, error)
-	OutstandingJobCount(ctx context.Context, workspaceID, workflowID uuid.UUID, runID ulid.ULID) (int, error)
-	RunningCount(ctx context.Context, functionID uuid.UUID) (int64, error)
-	StatusCount(ctx context.Context, workflowID uuid.UUID, status string) (int64, error)
+	PartitionBacklogSize(ctx context.Context, scope Scope, partitionID string) (int64, error)
+	OutstandingJobCount(ctx context.Context, scope Scope, runID ulid.ULID) (int, error)
+	RunningCount(ctx context.Context, scope Scope) (int64, error)
+	StatusCount(ctx context.Context, scope Scope, status string) (int64, error)
+	RunJobs(ctx context.Context, scope Scope, runID ulid.ULID, limit, offset int64) ([]JobResponse, error)
 }
 
 type ShardOperations interface {
@@ -340,28 +337,26 @@ type ShardOperations interface {
 
 	Scavenge(ctx context.Context, limit int) (int, error)
 
-	RemoveQueueItem(ctx context.Context, partitionID string, itemID string) error
+	RemoveQueueItem(ctx context.Context, scope Scope, partitionID string, itemID string) error
 
-	SetFunctionMigrate(ctx context.Context, fnID uuid.UUID, migrateLockUntil *time.Time) error
-	ResetAttemptsByJobID(ctx context.Context, jobID string) error
+	SetFunctionMigrate(ctx context.Context, scope Scope, migrateLockUntil *time.Time) error
+	ResetAttemptsByJobID(ctx context.Context, scope Scope, jobID string) error
 
-	PartitionSize(ctx context.Context, partitionID string, until time.Time) (int64, error)
+	PartitionSize(ctx context.Context, scope Scope, partitionID string, until time.Time) (int64, error)
 
-	ConfigLease(ctx context.Context, key string, duration time.Duration, existingLeaseID ...*ulid.ULID) (*ulid.ULID, error)
+	RoleLease(ctx context.Context, key string, duration time.Duration, existingLeaseID ...*ulid.ULID) (*ulid.ULID, error)
 	ShardLease(ctx context.Context, key string, duration time.Duration, maxLeases int, existingLeaseID ...*ulid.ULID) (*ulid.ULID, error)
 	ReleaseShardLease(ctx context.Context, key string, existingLeaseID ulid.ULID) error
 
 	LoadQueueItem(ctx context.Context, itemID string) (*QueueItem, error)
 
-	IsMigrationLocked(ctx context.Context, fnID uuid.UUID) (*time.Time, error)
+	IsMigrationLocked(ctx context.Context, scope Scope) (*time.Time, error)
 
-	ItemExists(ctx context.Context, jobID string) (bool, error)
-	ItemsByRunID(ctx context.Context, runID ulid.ULID) ([]*QueueItem, error)
-	PartitionByID(ctx context.Context, partitionID string) (*PartitionInspectionResult, error)
+	ItemExists(ctx context.Context, scope Scope, jobID string) (bool, error)
+	ItemsByRunID(ctx context.Context, scope Scope, runID ulid.ULID) ([]*QueueItem, error)
+	PartitionByID(ctx context.Context, scope Scope, partitionID string) (*PartitionInspectionResult, error)
 
-	UnpauseFunction(ctx context.Context, acctID, envID, fnID uuid.UUID) error
-
-	RunJobs(ctx context.Context, workspaceID, workflowID uuid.UUID, runID ulid.ULID, limit, offset int64) ([]JobResponse, error)
+	UnpauseFunction(ctx context.Context, scope Scope) error
 }
 
 type BacklogRefillOptions struct {

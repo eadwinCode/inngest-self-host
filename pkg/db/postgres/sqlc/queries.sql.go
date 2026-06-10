@@ -1232,6 +1232,148 @@ func (q *Queries) GetRunSpanByRunID(ctx context.Context, arg GetRunSpanByRunIDPa
 	return &i, err
 }
 
+const getRuns = `-- name: GetRuns :many
+WITH run_roots AS (
+  SELECT
+    spans.run_id,
+    spans.dynamic_span_id,
+    spans.function_id,
+    spans.app_id,
+    spans.start_time AS root_start_time,
+    spans.end_time AS root_end_time,
+    CAST(spans.output AS TEXT) AS root_output,
+    COALESCE((spans.attributes#>>'{}')::json->>'_inngest.function.slug', '') AS function_slug,
+    COALESCE((spans.attributes#>>'{}')::json->>'_inngest.function.name', '') AS function_name,
+    COALESCE(apps.name, '') AS app_name,
+    COALESCE((spans.attributes#>>'{}')::json->>'_inngest.batch.id', '') AS batch_id,
+    COALESCE((spans.attributes#>>'{}')::json->>'_inngest.cron.schedule', '') AS cron_schedule
+  FROM spans
+  LEFT JOIN apps ON apps.id::text = spans.app_id AND apps.archived_at IS NULL
+  WHERE spans.name = $1
+    AND spans.debug_run_id IS NULL
+    AND spans.run_id > $2::TEXT
+    AND EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements_text(NULLIF(spans.event_ids#>>'{}', '')::jsonb) AS eid(event_id)
+      WHERE eid.event_id = $3::TEXT
+    )
+  ORDER BY spans.run_id
+  LIMIT $4
+)
+SELECT
+  run_roots.run_id,
+  run_roots.function_id,
+  run_roots.app_id,
+  CAST(COALESCE((
+    SELECT MIN(group_spans.start_time)
+    FROM spans group_spans
+    WHERE group_spans.run_id = run_roots.run_id
+      AND group_spans.dynamic_span_id = run_roots.dynamic_span_id
+      AND group_spans.debug_run_id IS NULL
+  ), run_roots.root_start_time) AS TIMESTAMPTZ) AS start_time,
+  CAST(COALESCE((
+    SELECT MAX(group_spans.end_time)
+    FROM spans group_spans
+    WHERE group_spans.run_id = run_roots.run_id
+      AND group_spans.dynamic_span_id = run_roots.dynamic_span_id
+      AND group_spans.debug_run_id IS NULL
+  ), run_roots.root_end_time) AS TIMESTAMPTZ) AS end_time,
+  CAST(COALESCE((
+    SELECT status_spans.status
+    FROM spans status_spans
+    WHERE status_spans.run_id = run_roots.run_id
+      AND status_spans.dynamic_span_id = run_roots.dynamic_span_id
+      AND status_spans.debug_run_id IS NULL
+    ORDER BY status_spans.end_time DESC
+    LIMIT 1
+  ), '') AS TEXT) AS status,
+  COALESCE((
+    SELECT CAST(output_lookup.output AS TEXT)
+    FROM spans output_lookup
+    WHERE output_lookup.run_id = run_roots.run_id
+      AND output_lookup.output IS NOT NULL
+      AND output_lookup.debug_run_id IS NULL
+    ORDER BY
+      CASE WHEN COALESCE((output_lookup.attributes#>>'{}')::json->>'_inngest.is.function.output', '') IN ('true', '1') THEN 0 ELSE 1 END,
+      output_lookup.end_time DESC
+    LIMIT 1
+  ), run_roots.root_output, '') AS output,
+  run_roots.function_slug,
+  run_roots.function_name,
+  run_roots.app_name,
+  run_roots.batch_id,
+  run_roots.cron_schedule
+FROM run_roots
+ORDER BY run_roots.run_id
+`
+
+type GetRunsParams struct {
+	Name        string
+	CursorRunID string
+	EventID     string
+	LimitRows   int32
+}
+
+type GetRunsRow struct {
+	RunID        string
+	FunctionID   string
+	AppID        string
+	StartTime    time.Time
+	EndTime      time.Time
+	Status       string
+	Output       string
+	FunctionSlug interface{}
+	FunctionName interface{}
+	AppName      string
+	BatchID      interface{}
+	CronSchedule interface{}
+}
+
+// Mirrors the span-runs grouping the GraphQL runs list uses (GetSpanRuns): a
+// run is its executor.run root row plus extension rows sharing the root's
+// dynamic_span_id, and the latest row in that group carries the run's current
+// status. Child/step spans never decide run status.
+func (q *Queries) GetRuns(ctx context.Context, arg GetRunsParams) ([]*GetRunsRow, error) {
+	rows, err := q.db.QueryContext(ctx, getRuns,
+		arg.Name,
+		arg.CursorRunID,
+		arg.EventID,
+		arg.LimitRows,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []*GetRunsRow
+	for rows.Next() {
+		var i GetRunsRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.FunctionID,
+			&i.AppID,
+			&i.StartTime,
+			&i.EndTime,
+			&i.Status,
+			&i.Output,
+			&i.FunctionSlug,
+			&i.FunctionName,
+			&i.AppName,
+			&i.BatchID,
+			&i.CronSchedule,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getSpanBySpanID = `-- name: GetSpanBySpanID :one
 SELECT
   run_id,
@@ -1502,6 +1644,80 @@ func (q *Queries) GetSpansByRunID(ctx context.Context, dollar_1 string) ([]*GetS
 			&i.DynamicSpanID,
 			&i.StartTime,
 			&i.EndTime,
+			&i.ParentSpanID,
+			&i.SpanFragments,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const getSpansByRunIDsAndName = `-- name: GetSpansByRunIDsAndName :many
+SELECT
+  s.run_id,
+  s.trace_id,
+  s.dynamic_span_id,
+  MIN(s.start_time) AS span_start_time,
+  MAX(s.end_time) AS span_end_time,
+  s.parent_span_id,
+  json_agg(json_build_object(
+    'span_id', s.span_id,
+    'name', s.name,
+    'attributes', s.attributes,
+    'links', s.links,
+    'output_span_id', CASE WHEN s.output IS NOT NULL THEN s.span_id ELSE NULL END,
+    'input_span_id', CASE WHEN s.input IS NOT NULL THEN s.span_id ELSE NULL END
+  )) AS span_fragments
+FROM spans AS s
+JOIN spans AS m ON m.dynamic_span_id = s.dynamic_span_id
+WHERE m.name = $1
+  AND m.run_id IN (SELECT UNNEST($2::TEXT[]))
+GROUP BY s.run_id, s.trace_id, s.dynamic_span_id, s.parent_span_id
+ORDER BY s.run_id, span_start_time
+`
+
+type GetSpansByRunIDsAndNameParams struct {
+	Name   string
+	RunIds []string
+}
+
+type GetSpansByRunIDsAndNameRow struct {
+	RunID         string
+	TraceID       string
+	DynamicSpanID sql.NullString
+	SpanStartTime interface{}
+	SpanEndTime   interface{}
+	ParentSpanID  sql.NullString
+	SpanFragments json.RawMessage
+}
+
+// Returns spans by name with their current attribute values, merging in any
+// updates applied later via UpdateSpan. The self-join on dynamic_span_id picks
+// up follow-up rows (e.g. status flips, post-emit attribute stamps) that don't
+// carry the span name and would otherwise be filtered out.
+func (q *Queries) GetSpansByRunIDsAndName(ctx context.Context, arg GetSpansByRunIDsAndNameParams) ([]*GetSpansByRunIDsAndNameRow, error) {
+	rows, err := q.db.QueryContext(ctx, getSpansByRunIDsAndName, arg.Name, pq.Array(arg.RunIds))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []*GetSpansByRunIDsAndNameRow
+	for rows.Next() {
+		var i GetSpansByRunIDsAndNameRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.TraceID,
+			&i.DynamicSpanID,
+			&i.SpanStartTime,
+			&i.SpanEndTime,
 			&i.ParentSpanID,
 			&i.SpanFragments,
 		); err != nil {
@@ -2074,8 +2290,9 @@ INSERT INTO spans (
   debug_run_id,
   debug_session_id,
   status,
-  event_ids
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+  event_ids,
+  is_deferred
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 `
 
 type InsertSpanParams struct {
@@ -2099,6 +2316,7 @@ type InsertSpanParams struct {
 	DebugSessionID sql.NullString
 	Status         sql.NullString
 	EventIds       pqtype.NullRawMessage
+	IsDeferred     sql.NullBool
 }
 
 // New
@@ -2124,6 +2342,7 @@ func (q *Queries) InsertSpan(ctx context.Context, arg InsertSpanParams) error {
 		arg.DebugSessionID,
 		arg.Status,
 		arg.EventIds,
+		arg.IsDeferred,
 	)
 	return err
 }

@@ -4,11 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"time"
 
-	"errors"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/inngest/inngest/pkg/api/apiv1/apiv1auth"
@@ -81,6 +81,11 @@ type CheckpointAPIOpts struct {
 	BackoffFunc backoff.BackoffFunc
 	// AllowStepMetadata controls whether step metadata is allowed for a given account.
 	AllowStepMetadata executor.AllowStepMetadata
+	// EnforceStepSizeLimits controls whether step output size limits are enforced for a given account.
+	// The default is to always enforce the limits.
+	EnforceStepSizeLimits func(ctx context.Context, accountID uuid.UUID) bool
+	// AllowAsyncDispatchValidation gates the dispatch validator per account.
+	AllowAsyncDispatchValidation checkpoint.AllowAsyncDispatchValidation
 }
 
 // checkpointAPI is the base implementation.
@@ -102,14 +107,16 @@ type checkpointAPI struct {
 
 func NewCheckpointAPI(o Opts) CheckpointAPI {
 	c := checkpoint.New(checkpoint.Opts{
-		State:             o.State,
-		FnReader:          o.FunctionReader,
-		Executor:          o.Executor,
-		TracerProvider:    o.TracerProvider,
-		Queue:             o.Queue,
-		MetricsProvider:   o.CheckpointOpts.CheckpointMetrics,
-		BackoffFunc:       o.CheckpointOpts.BackoffFunc,
-		AllowStepMetadata: o.CheckpointOpts.AllowStepMetadata,
+		State:                        o.State,
+		FnReader:                     o.FunctionReader,
+		Executor:                     o.Executor,
+		TracerProvider:               o.TracerProvider,
+		Queue:                        o.Queue,
+		MetricsProvider:              o.CheckpointOpts.CheckpointMetrics,
+		BackoffFunc:                  o.CheckpointOpts.BackoffFunc,
+		AllowStepMetadata:            o.CheckpointOpts.AllowStepMetadata,
+		EnforceStepSizeLimits:        o.CheckpointOpts.EnforceStepSizeLimits,
+		AllowAsyncDispatchValidation: o.CheckpointOpts.AllowAsyncDispatchValidation,
 	})
 
 	api := checkpointAPI{
@@ -368,16 +375,20 @@ func (a checkpointAPI) CheckpointAsyncSteps(w http.ResponseWriter, r *http.Reque
 	input.TrackLatency(ctx)
 
 	err = a.checkpointer.CheckpointAsyncSteps(ctx, checkpoint.AsyncCheckpoint{
-		RunID:        input.RunID,
-		FnID:         input.FnID,
-		Steps:        input.Steps,
-		QueueItemRef: input.QueueItemRef,
-		AccountID:    auth.AccountID(),
-		EnvID:        auth.WorkspaceID(),
+		RunID:            input.RunID,
+		FnID:             input.FnID,
+		Steps:            input.Steps,
+		QueueItemRef:     input.QueueItemRef,
+		RequestID:        input.RequestID,
+		GenerationID:     input.GenerationID,
+		RequestStartedAt: input.RequestStartedAt,
+		AccountID:        auth.AccountID(),
+		EnvID:            auth.WorkspaceID(),
 	})
 	if err != nil {
 		status := http.StatusBadRequest
-		if errors.Is(err, state.ErrStepOutputTooLarge) || errors.Is(err, state.ErrStateOverflowed) {
+		switch {
+		case errors.Is(err, state.ErrStepOutputTooLarge), errors.Is(err, state.ErrStateOverflowed):
 			logger.StdlibLogger(ctx).Error("async checkpoint rejected",
 				"run_id", input.RunID,
 				"fn_id", input.FnID,
@@ -385,7 +396,10 @@ func (a checkpointAPI) CheckpointAsyncSteps(w http.ResponseWriter, r *http.Reque
 				"error", err,
 			)
 			status = http.StatusRequestEntityTooLarge
-		} else {
+		case errors.Is(err, checkpoint.ErrStaleDispatch):
+			logger.StdlibLogger(ctx).Error("error checkpointing async steps", "error", err)
+			status = http.StatusConflict
+		default:
 			logger.StdlibLogger(ctx).Error("error checkpointing async steps", "error", err)
 		}
 		_ = publicerr.WriteHTTP(w, publicerr.Error{
@@ -395,6 +409,7 @@ func (a checkpointAPI) CheckpointAsyncSteps(w http.ResponseWriter, r *http.Reque
 			},
 			Status: status,
 		})
+		return
 	}
 }
 

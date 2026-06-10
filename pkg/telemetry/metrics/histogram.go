@@ -431,6 +431,20 @@ func HistogramCheckpointStartLatency(ctx context.Context, age time.Duration, typ
 	})
 }
 
+func HistogramCheckpointAsyncDispatchValidationDuration(ctx context.Context, dur time.Duration, opts HistogramOpt) {
+	RecordIntHistogramMetric(ctx, dur.Milliseconds(), HistogramOpt{
+		PkgName:     opts.PkgName,
+		MetricName:  "checkpoint_async_dispatch_validation_duration",
+		Description: "Distribution of time spent validating async checkpoint dispatch staleness, tagged by result",
+		Tags:        opts.Tags,
+		Unit:        "ms",
+		// Fast-path skips are sub-ms; the slow path is dominated by a single
+		// Redis HGET (~1–10ms typical). DefaultBoundaries (10ms+) collapses
+		// both into one bucket. Top bucket of 1s catches anomalies.
+		Boundaries: []float64{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000},
+	})
+}
+
 func HistogramQueueScavengerPartitionScavengeDuration(ctx context.Context, dur time.Duration, opts HistogramOpt) {
 	RecordIntHistogramMetric(ctx, dur.Milliseconds(), HistogramOpt{
 		PkgName:     opts.PkgName,
@@ -653,5 +667,31 @@ func HistogramDefersPerRun(ctx context.Context, count int64, opts HistogramOpt) 
 		Description: "Distribution of the number of defers loaded per finalized run",
 		Tags:        opts.Tags,
 		Boundaries:  []float64{1, 2, 5, 10, 15, 20},
+	})
+}
+
+func HistogramMetadataGetParentSpanDuration(
+	ctx context.Context,
+	dur time.Duration,
+	attempts int,
+	opts HistogramOpt,
+) {
+	if opts.Tags == nil {
+		opts.Tags = map[string]any{}
+	}
+
+	// Always be true, but we'll add this check to protect cardinality just in
+	// case
+	if attempts < 10 {
+		opts.Tags["attempts"] = attempts
+	}
+
+	RecordIntHistogramMetric(ctx, dur.Milliseconds(), HistogramOpt{
+		PkgName:     opts.PkgName,
+		MetricName:  "metadata_get_parent_span_duration",
+		Description: "Distribution of latency when getting parent span in metadata endpoint",
+		Tags:        opts.Tags,
+		Unit:        "ms",
+		Boundaries:  []float64{10, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000, 60000, 120_000},
 	})
 }
