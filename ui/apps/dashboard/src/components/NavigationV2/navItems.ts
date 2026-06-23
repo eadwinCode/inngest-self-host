@@ -6,7 +6,9 @@ import { ExperimentsIcon } from '@inngest/components/icons/sections/Experiments'
 import { FunctionsIcon } from '@inngest/components/icons/sections/Functions';
 import { InsightsIcon } from '@inngest/components/icons/sections/Insights';
 import { MetricsIcon } from '@inngest/components/icons/sections/Metrics';
+import { OverviewIcon } from '@inngest/components/icons/sections/Overview';
 import { RunsIcon } from '@inngest/components/icons/sections/Runs';
+import { SessionsIcon } from '@inngest/components/icons/sections/Sessions';
 import { WebhooksIcon } from '@inngest/components/icons/sections/Webhooks';
 
 export type NavItemConfig = {
@@ -21,9 +23,22 @@ export type NavItemConfig = {
 export type NavGroupConfig = {
   heading: string;
   items: NavItemConfig[];
+  beta?: boolean;
 };
 
-export const observe: NavGroupConfig = {
+export const workflow: NavGroupConfig = {
+  heading: 'Workflow',
+  items: [
+    { label: 'Overview', route: '', Icon: OverviewIcon, exact: true },
+    { label: 'Apps', route: 'apps', Icon: AppsIcon },
+    { label: 'Functions', route: 'functions', Icon: FunctionsIcon },
+    { label: 'Runs', route: 'runs', Icon: RunsIcon },
+    { label: 'Event Types', route: 'event-types', Icon: EventsIcon },
+    { label: 'Events', route: 'events', Icon: EventLogsIcon },
+  ],
+};
+
+export const monitor: NavGroupConfig = {
   heading: 'Monitor',
   items: [
     { label: 'Metrics', route: 'metrics', Icon: MetricsIcon },
@@ -31,28 +46,25 @@ export const observe: NavGroupConfig = {
   ],
 };
 
-export const workflow: NavGroupConfig = {
-  heading: 'Workflow',
-  items: [
-    { label: 'Overview', route: '', Icon: MetricsIcon, exact: true },
-    { label: 'Functions', route: 'functions', Icon: FunctionsIcon },
-    { label: 'Runs', route: 'runs', Icon: RunsIcon },
-    { label: 'Events', route: 'events', Icon: EventLogsIcon },
-  ],
-};
-
 export const experimentsItem: NavItemConfig = {
   label: 'Experiments',
   route: 'experiments',
   Icon: ExperimentsIcon,
-  beta: true,
+};
+
+export const scoresItem: NavItemConfig = {
+  label: 'Scores',
+  route: 'scores',
+  Icon: InsightsIcon,
+};
+
+export const sessionsItem: NavItemConfig = {
+  label: 'Sessions',
+  route: 'sessions',
+  Icon: SessionsIcon,
 };
 
 export const manage: NavGroupConfig = {
   heading: 'Manage',
-  items: [
-    { label: 'Apps', route: 'apps', Icon: AppsIcon },
-    { label: 'Event Types', route: 'event-types', Icon: EventsIcon },
-    { label: 'Webhooks', route: 'manage/webhooks', Icon: WebhooksIcon },
-  ],
+  items: [{ label: 'Webhooks', route: 'manage/webhooks', Icon: WebhooksIcon }],
 };
