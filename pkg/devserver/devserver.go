@@ -532,6 +532,7 @@ func start(ctx context.Context, opts StartOpts) error {
 				run.NewTraceLifecycleListener(nil),
 			}, metrics.NewLifecycleListeners()...)...,
 		),
+		executor.WithEventLifecycleListeners(execution.NoopEventLifecycleListener{}),
 		executor.WithStepLimits(func(id sv2.ID) int {
 			if override, hasOverride := stepLimitOverrides[id.FunctionID.String()]; hasOverride {
 				l.Warn("using step limit override", "override", override, "fn_id", id.FunctionID)
@@ -584,7 +585,7 @@ func start(ctx context.Context, opts StartOpts) error {
 		opts.Config,
 		executor.WithExecutionManager(dbcqrs),
 		executor.WithState(sm),
-		executor.WithServiceQueue(rq),
+		executor.WithServiceQueueProcessor(rq),
 		executor.WithServiceExecutor(exec),
 		executor.WithServiceBatcher(batcher),
 		executor.WithServiceDebouncer(debouncer),
@@ -592,9 +593,6 @@ func start(ctx context.Context, opts StartOpts) error {
 		executor.WithServiceLogger(l),
 		executor.WithServiceShardRegistry(shardRegistry),
 		executor.WithServicePublisher(pb),
-		executor.WithServiceEnableKeyQueues(func(ctx context.Context, acctID uuid.UUID) bool {
-			return enableKeyQueues
-		}),
 	)
 
 	runner := runner.NewService(
@@ -604,7 +602,6 @@ func start(ctx context.Context, opts StartOpts) error {
 		runner.WithExecutionManager(dbcqrs),
 		runner.WithPauseManager(pauseMgr),
 		runner.WithStateManager(sm),
-		runner.WithRunnerQueue(rq),
 		runner.WithBatchManager(batcher),
 		runner.WithCronManager(croner),
 		runner.WithPublisher(pb),
@@ -614,7 +611,6 @@ func start(ctx context.Context, opts StartOpts) error {
 	// The devserver embeds the event API.
 	ds := NewService(opts, runner, dbcqrs, pb, stepLimitOverrides, stateSizeLimitOverrides, unshardedRc, hd, nil)
 	ds.State = sm
-	ds.Queue = rq
 	ds.Executor = exec
 	ds.SemaphoreManager = semaphores
 	ds.CronSyncer = croner
@@ -639,7 +635,7 @@ func start(ctx context.Context, opts StartOpts) error {
 		Logger:         l,
 		Runner:         ds.Runner,
 		State:          ds.State,
-		Queue:          ds.Queue,
+		QueueReader:    rq,
 		EventHandler:   ds.HandleEvent,
 		Executor:       ds.Executor,
 		HistoryReader:  cqrsmanager.NewHistoryReader(adapter),
@@ -670,7 +666,6 @@ func start(ctx context.Context, opts StartOpts) error {
 			AuthMiddleware:    authn.SigningKeyMiddleware(opts.SigningKey),
 			CachingMiddleware: caching,
 			FunctionReader:    ds.Data,
-			JobQueueReader:    ds.Queue.(queue.JobQueueReader),
 			Executor:          ds.Executor,
 			Queue:             rq,
 			QueueShards:       shardRegistry,
@@ -738,6 +733,17 @@ func start(ctx context.Context, opts StartOpts) error {
 		FunctionTraces:      NewFunctionTraceReader(dbcqrs),
 		Executor:            exec,
 		EventPublisher:      runner,
+		Scores: apiv2.NewStateScoreProvider(apiv2.StateScoreProviderOptions{
+			State:          smv2,
+			TracerProvider: tp,
+			Auth: func(ctx context.Context) (uuid.UUID, uuid.UUID, error) {
+				return consts.DevServerAccountID, consts.DevServerEnvID, nil
+			},
+			Enabled: func(ctx context.Context, accountID uuid.UUID) bool {
+				return enableStepMetadata
+			},
+			MissingStateLoader: scoreMetadataLoader(dbcqrs),
+		}),
 	}
 
 	apiv2Base := apiv2base.NewBase()
@@ -767,7 +773,6 @@ func start(ctx context.Context, opts StartOpts) error {
 	if testapi.ShouldEnable() {
 		mounts = append(mounts, api.Mount{At: "/test", Handler: testapi.New(testapi.Options{
 			QueueShards:  shardRegistry,
-			Queue:        rq,
 			Executor:     exec,
 			StateManager: smv2,
 			ResetAll: func() {
@@ -807,7 +812,7 @@ func start(ctx context.Context, opts StartOpts) error {
 		services = append(services, debugapi.NewDebugAPI(debugapi.Opts{
 			Log:              l,
 			DB:               ds.Data,
-			Queue:            rq,
+			QueueReader:      rq,
 			State:            ds.State,
 			Cron:             croner,
 			ShardRegistry:    shardRegistry,

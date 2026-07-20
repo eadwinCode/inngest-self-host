@@ -131,8 +131,8 @@ func TestGetQueueItemByRunIDResolvesShardFromScope(t *testing.T) {
 			accountShard.Name(): accountShard,
 		},
 		queue.WithPrimary(defaultShard),
-		queue.WithShardSelector(func(ctx context.Context, id uuid.UUID, queueName *string) (queue.QueueShard, error) {
-			if id == accountID {
+		queue.WithShardSelector(func(ctx context.Context, scope queue.Scope, queueName *string) (queue.QueueShard, error) {
+			if scope.AccountID == accountID {
 				return accountShard, nil
 			}
 			return defaultShard, nil
@@ -158,8 +158,8 @@ func TestGetQueueItemByRunIDResolvesShardFromScope(t *testing.T) {
 	require.NoError(t, err)
 
 	d := &debugAPI{
-		queue:  q,
-		shards: shardRegistry,
+		queueReader: q,
+		shards:      shardRegistry,
 	}
 
 	resp, err := d.GetQueueItem(ctx, &pb.QueueItemRequest{
@@ -305,8 +305,9 @@ func TestGetDebounceInfoHandler(t *testing.T) {
 		},
 	}
 
-	err := redisDebouncer.Debounce(ctx, di, fn)
+	debounceID, err := redisDebouncer.Debounce(ctx, di, fn)
 	require.NoError(t, err)
+	require.NotNil(t, debounceID)
 
 	// Test handler correctly converts debouncer response to protobuf
 	resp, err := d.GetDebounceInfo(ctx, &pb.DebounceInfoRequest{
@@ -962,8 +963,9 @@ func TestDeleteDebounceHandler(t *testing.T) {
 		},
 	}
 
-	err := redisDebouncer.Debounce(ctx, di, fn)
+	debounceID, err := redisDebouncer.Debounce(ctx, di, fn)
 	require.NoError(t, err)
+	require.NotNil(t, debounceID)
 
 	// Test handler correctly deletes the debounce
 	resp, err := d.DeleteDebounce(ctx, &pb.DeleteDebounceRequest{
@@ -1027,8 +1029,9 @@ func TestRunDebounceHandler(t *testing.T) {
 		},
 	}
 
-	err := redisDebouncer.Debounce(ctx, di, fn)
+	debounceID, err := redisDebouncer.Debounce(ctx, di, fn)
 	require.NoError(t, err)
+	require.NotNil(t, debounceID)
 
 	// Test handler correctly schedules the debounce
 	resp, err := d.RunDebounce(ctx, &pb.RunDebounceRequest{
@@ -1080,8 +1083,9 @@ func TestDeleteDebounceByIDHandler(t *testing.T) {
 		},
 	}
 
-	err := redisDebouncer.Debounce(ctx, di, fn)
+	debounceID, err := redisDebouncer.Debounce(ctx, di, fn)
 	require.NoError(t, err)
+	require.NotNil(t, debounceID)
 
 	infoResp, err := d.GetDebounceInfo(ctx, &pb.DebounceInfoRequest{
 		FunctionId:  functionID.String(),

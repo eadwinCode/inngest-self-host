@@ -788,6 +788,9 @@ func (q *queue) RequeueByJobID(ctx context.Context, jobID string, at time.Time) 
 	// Find the queue item so that we can fetch the shard info.
 	i := osqueue.QueueItem{}
 	if err := q.RedisClient.unshardedRc.Do(ctx, q.RedisClient.unshardedRc.B().Hget().Key(q.RedisClient.kg.QueueItem()).Field(jobID).Build()).DecodeJSON(&i); err != nil {
+		if err == rueidis.Nil {
+			return osqueue.ErrQueueItemNotFound
+		}
 		return err
 	}
 
@@ -1548,7 +1551,7 @@ func (q *queue) partitionPeek(ctx context.Context, partitionKey string, sequenti
 				// in case the function was unpaused in the last 60s.
 				if !info.Stale {
 					// Function is pulled up when it is unpaused, so we can push it back for a long time (see SetFunctionPaused)
-					err := q.PartitionRequeue(ctx, item, q.Clock.Now().Truncate(time.Second).Add(osqueue.PartitionPausedRequeueExtension), true)
+					err := q.PartitionRequeue(ctx, item, q.Clock.Now().Truncate(time.Second).Add(q.PausedRequeueExtension()), true)
 					if err != nil && !errors.Is(err, osqueue.ErrPartitionGarbageCollected) {
 						l.Error("failed to push back paused partition", "error", err, "partition", item)
 					} else {
