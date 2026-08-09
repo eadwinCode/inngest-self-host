@@ -12,7 +12,6 @@ import (
 	"github.com/jonboulle/clockwork"
 	"github.com/karlseguin/ccache/v3"
 	"github.com/oklog/ulid/v2"
-	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -214,7 +213,14 @@ func (q *queueProcessor) Queue() Queue {
 }
 
 func (q *queueProcessor) Run(ctx context.Context, f RunFunc) error {
-	// claimShardLease will block until a shard lease is obtained to process the primary shard.
+	workerCtx, stopWorkers := context.WithCancel(ctx)
+	defer stopWorkers()
+
+	wrappedF := q.wrapRunFuncWithLatency(f)
+	for i := int32(0); i < q.numWorkers; i++ {
+		go q.worker(workerCtx, wrappedF)
+	}
+
 	l := logger.StdlibLogger(ctx)
 	if len(q.runMode.ShardGroup) != 0 {
 		l.Info("Executor started in ShardGroup mode, attempting to claim a shard lease", "shard_group", q.runMode.ShardGroup)
@@ -229,34 +235,47 @@ func (q *queueProcessor) Run(ctx context.Context, f RunFunc) error {
 		go q.runRole(ctx, role)
 	}
 
-	wrappedF := q.wrapRunFuncWithLatency(f)
-
-	// start execution and shadow scan concurrently
-	eg, ctx := errgroup.WithContext(ctx)
-
-	eg.Go(func() error {
-		return q.executionScan(ctx, wrappedF)
-	})
-
-	if q.runMode.ShadowPartition {
-		eg.Go(func() error {
-			return q.shadowScan(ctx)
-		})
+	scanner := QueueScanner(partitionQueueScanner{q: q})
+	if shard := q.Shard(); shard != nil {
+		if shardScanner, ok := shard.(QueueScanner); ok {
+			scanner = shardScanner
+		}
 	}
 
-	if q.runMode.NormalizePartition {
-		eg.Go(func() error {
-			return q.backlogNormalizationScan(ctx)
-		})
+	dispatch := func(ctx context.Context, item ProcessItem) (DispatchedItem, error) {
+		handle := newDispatchedItemHandle()
+		item.result = handle
+
+		select {
+		case q.workers <- item:
+			return handle, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
-	return eg.Wait()
+	rt := QueueScannerRuntime{
+		Leaser:          q,
+		Dispatch:        dispatch,
+		WorkerSemaphore: q.Semaphore(),
+	}
+	if rt.Leaser == nil {
+		return ErrQueueScannerMissingLeaser
+	}
+
+	err := scanner.Run(ctx, rt)
+
+	l.Info("queue waiting to quit", "err", err)
+	q.wg.Wait()
+	l.Info("in-progress jobs finished, exiting queue processor", "err", err)
+
+	return err
 }
 
 func (q *queueProcessor) capacity() int64 {
-	return int64(q.numWorkers) - q.Semaphore().Count()
+	return q.Semaphore().Available()
 }
 
 func (q *queueProcessor) partitionCapacity() int64 {
-	return int64(q.numPartitionWorkers) - q.partitionSem.Count()
+	return q.partitionSem.Available()
 }

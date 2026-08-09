@@ -122,8 +122,8 @@ type QueueProcessor interface {
 		ctx context.Context,
 		i ProcessItem,
 		f RunFunc,
-	) error
-	ProcessPartition(ctx context.Context, p *QueuePartition, continuationCount uint, randomOffset bool) error
+	) (ProcessItemResult, error)
+	ProcessPartition(ctx context.Context, p *QueuePartition, continuationCount uint, randomOffset bool, dispatch DispatchFunc) error
 }
 
 // SingletonOperations is the per-shard surface for singleton lock state.

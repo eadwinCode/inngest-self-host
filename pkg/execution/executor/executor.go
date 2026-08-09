@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"runtime/debug"
 	"slices"
@@ -170,6 +171,16 @@ func WithHTTPClient(c exechttp.RequestExecutor) ExecutorOpt {
 func WithCancellationChecker(c cancellation.Checker) ExecutorOpt {
 	return func(e execution.Executor) error {
 		e.(*executor).cancellationChecker = c
+		return nil
+	}
+}
+
+// WithCancellationCheckDeadline bounds how long checkCancellation waits
+// synchronously for the cancellation lookup before proceeding. A zero or
+// negative value keeps the default of 100ms.
+func WithCancellationCheckDeadline(d time.Duration) ExecutorOpt {
+	return func(e execution.Executor) error {
+		e.(*executor).cancellationCheckDeadline = d
 		return nil
 	}
 }
@@ -506,13 +517,14 @@ type executor struct {
 	useConstraintAPI              constraintapi.UseConstraintAPIFn
 	enableBatchingInstrumentation func(ctx context.Context, accountID, envID uuid.UUID) (enable bool)
 
-	fl                  state.FunctionLoader
-	evalFactory         func(ctx context.Context, expr string) (expressions.Evaluator, error)
-	finishHandler       execution.FinalizePublisher
-	invokeFailHandler   execution.InvokeFailHandler
-	handleInvokeEvent   execution.HandleInvokeEvent
-	cancellationChecker cancellation.Checker
-	httpClient          exechttp.RequestExecutor
+	fl                        state.FunctionLoader
+	evalFactory               func(ctx context.Context, expr string) (expressions.Evaluator, error)
+	finishHandler             execution.FinalizePublisher
+	invokeFailHandler         execution.InvokeFailHandler
+	handleInvokeEvent         execution.HandleInvokeEvent
+	cancellationChecker       cancellation.Checker
+	cancellationCheckDeadline time.Duration
+	httpClient                exechttp.RequestExecutor
 	// signingKeyLoader is used to load signing keys for an env.  This is required for the
 	// HTTPv2 driver.
 	signingKeyLoader func(ctx context.Context, envID uuid.UUID) ([]byte, error)
@@ -580,14 +592,27 @@ func (e *executor) runEventLifecycles(ctx context.Context, fn func(context.Conte
 	for _, l := range e.evtLifecycles {
 		l := l
 		service.Go(func() {
+			// Event lifecycle listeners are observability side effects
+			// (metrics, exporters); a panicking implementation must never
+			// crash scheduling or the service.
+			defer func() {
+				if r := recover(); r != nil {
+					e.log.Error(
+						"panic in event lifecycle listener",
+						"error", r,
+						"stack", string(debug.Stack()),
+					)
+				}
+			}()
 			fn(ctx, l)
 		})
 	}
 }
 
 func (e *executor) RunFunctionMatchLifecycle(ctx context.Context, req execution.ScheduleRequest) {
+	reqSnapshot := cloneScheduleRequest(req)
 	e.runEventLifecycles(ctx, func(ctx context.Context, l execution.EventLifecycleListener) {
-		l.OnFunctionMatch(ctx, req)
+		l.OnFunctionMatch(ctx, reqSnapshot)
 	})
 }
 
@@ -647,6 +672,9 @@ func rerunFromStepEdge(req execution.ScheduleRequest, memoizedSteps []state.Memo
 	if req.FromStep == nil || req.FromStep.StepID == "" {
 		return inngest.SourceEdge
 	}
+	if result == nil || result.fromStepID == "" {
+		panic("rerun from step reconstruction result is required")
+	}
 
 	edge := inngest.Edge{
 		Incoming: inngest.TriggerName,
@@ -654,7 +682,7 @@ func rerunFromStepEdge(req execution.ScheduleRequest, memoizedSteps []state.Memo
 	if shouldTargetRerunFromStep(result) {
 		//
 		// Runnable steps should execute directly with any FromStep input override.
-		edge.IncomingGeneratorStep = req.FromStep.StepID
+		edge.IncomingGeneratorStep = result.fromStepID
 	}
 	if len(memoizedSteps) > 0 {
 		//
@@ -930,6 +958,8 @@ func (e *executor) Schedule(ctx context.Context, req execution.ScheduleRequest) 
 		requestTime = req.Events[0].GetReceivedAt()
 	}
 
+	callbackReq := cloneScheduleRequest(req)
+
 	// Check constraints and acquire lease
 	md, err := WithConstraints(
 		ctx,
@@ -946,7 +976,7 @@ func (e *executor) Schedule(ctx context.Context, req execution.ScheduleRequest) 
 					md  *sv2.Metadata
 					err error
 				)
-				runID, md, err = e.schedule(ctx, req, *runID, key, performChecks)
+				runID, md, err = e.schedule(ctx, req, *runID, key, performChecks, &callbackReq)
 				return md, err
 			}, util.WithBoundaries(2*time.Second))
 		})
@@ -954,7 +984,7 @@ func (e *executor) Schedule(ctx context.Context, req execution.ScheduleRequest) 
 	switch {
 	case errors.Is(err, ErrFunctionRateLimited):
 		e.runEventLifecycles(ctx, func(ctx context.Context, l execution.EventLifecycleListener) {
-			l.OnRateLimited(ctx, req)
+			l.OnRateLimited(ctx, callbackReq)
 		})
 	case errors.Is(err, ErrFunctionSkippedIdempotency),
 		errors.Is(err, state.ErrIdentifierExists),
@@ -966,17 +996,28 @@ func (e *executor) Schedule(ctx context.Context, req execution.ScheduleRequest) 
 			skip.ExistingRunID = runID
 		}
 		e.runEventLifecycles(ctx, func(ctx context.Context, l execution.EventLifecycleListener) {
-			l.OnFunctionSkippedIdempotency(ctx, req, skip)
+			l.OnFunctionSkippedIdempotency(ctx, callbackReq, skip)
 		})
 	case errors.Is(err, ErrFunctionDebounced), errors.Is(err, ErrFunctionSkipped), err == nil:
 		// Handled by more specific lifecycle hooks inside schedule.
 	default:
 		e.runEventLifecycles(ctx, func(ctx context.Context, l execution.EventLifecycleListener) {
-			l.OnFunctionScheduleFailed(ctx, req, err)
+			l.OnFunctionScheduleFailed(ctx, callbackReq, err)
 		})
 	}
 
 	return runID, md, err
+}
+
+func cloneScheduleRequest(req execution.ScheduleRequest) execution.ScheduleRequest {
+	req.Context = maps.Clone(req.Context)
+	req.Events = slices.Clone(req.Events)
+	return req
+}
+
+func cloneMetadata(md sv2.Metadata) sv2.Metadata {
+	md.Config.Context = maps.Clone(md.Config.Context)
+	return md
 }
 
 func (e *executor) now() time.Time {
@@ -1000,9 +1041,15 @@ func (e *executor) schedule(
 	// performChecks determines whether constraint checks must be performed
 	// This may be false when the Constraint API was used to enforce constraints.
 	performChecks bool,
+	callbackReq *execution.ScheduleRequest,
 ) (*ulid.ULID, *sv2.Metadata, error) {
 	if req.AppID == uuid.Nil {
 		return nil, nil, fmt.Errorf("app ID is required to schedule a run")
+	}
+
+	req = cloneScheduleRequest(req)
+	if callbackReq != nil {
+		*callbackReq = cloneScheduleRequest(req)
 	}
 
 	ctx, span := e.conditionalTracer.NewUserSpan(ctx, "executor.schedule", req.AccountID, req.WorkspaceID, req.Function.ID)
@@ -1109,8 +1156,9 @@ func (e *executor) schedule(
 		}
 		span.End()
 
+		reqSnapshot := cloneScheduleRequest(req)
 		e.runEventLifecycles(ctx, func(ctx context.Context, l execution.EventLifecycleListener) {
-			l.OnDebounced(ctx, req, item, debounceID)
+			l.OnDebounced(ctx, reqSnapshot, item, debounceID)
 		})
 
 		return nil, nil, ErrFunctionDebounced
@@ -1213,6 +1261,13 @@ func (e *executor) schedule(
 	carrier := itrace.NewTraceCarrier(itrace.WithTraceCarrierSpanID(&spanID))
 	itrace.UserTracer().Propagator().Inject(ctx, propagation.MapCarrier(carrier.Context))
 	config.SetFunctionTrace(carrier)
+
+	// Event lifecycles that run after scheduling should observe the fully
+	// enriched request context, not just the caller-provided fields.
+	reqSnapshot := cloneScheduleRequest(req)
+	if callbackReq != nil {
+		*callbackReq = reqSnapshot
+	}
 
 	metadata := sv2.Metadata{
 		ID: sv2.ID{
@@ -1349,7 +1404,7 @@ func (e *executor) schedule(
 						l.ReportError(err, "error canceling singleton run")
 					}
 					e.runEventLifecycles(ctx, func(ctx context.Context, l execution.EventLifecycleListener) {
-						l.OnSingletonCancelled(ctx, req, runID)
+						l.OnSingletonCancelled(ctx, reqSnapshot, runID)
 					})
 
 				default:
@@ -1552,7 +1607,7 @@ func (e *executor) schedule(
 	// If the function is being skipped, send spans and handle skip.
 	if skipReason != enums.SkipReasonNone {
 		sendSpans()
-		return e.handleFunctionSkipped(ctx, req, metadata, evts, skipReason)
+		return e.handleFunctionSkipped(ctx, reqSnapshot, metadata, evts, skipReason)
 	}
 
 	if req.BatchID == nil {
@@ -1643,8 +1698,9 @@ func (e *executor) schedule(
 		for _, e := range e.lifecycles {
 			go e.OnFunctionScheduled(context.WithoutCancel(ctx), metadata, item, req.Events)
 		}
+		metadataSnapshot := cloneMetadata(metadata)
 		e.runEventLifecycles(ctx, func(ctx context.Context, l execution.EventLifecycleListener) {
-			l.OnFunctionScheduled(ctx, metadata, req.Events)
+			l.OnFunctionScheduled(ctx, metadataSnapshot, reqSnapshot.Events)
 		})
 		return &metadata.ID.RunID, &metadata, nil
 	}
@@ -1740,7 +1796,7 @@ func (e *executor) schedule(
 		if deleteErr != nil {
 			l.ReportError(deleteErr, "error deleting function state, this has likely leaked state")
 		}
-		return e.handleFunctionSkipped(ctx, req, metadata, evts, enums.SkipReasonSingleton)
+		return e.handleFunctionSkipped(ctx, reqSnapshot, metadata, evts, enums.SkipReasonSingleton)
 
 	default:
 		return nil, nil, fmt.Errorf("error enqueueing source edge '%v': %w", queueKey, err)
@@ -1750,8 +1806,9 @@ func (e *executor) schedule(
 	for _, e := range e.lifecycles {
 		go e.OnFunctionScheduled(context.WithoutCancel(ctx), metadata, item, req.Events)
 	}
+	metadataSnapshot := cloneMetadata(metadata)
 	e.runEventLifecycles(ctx, func(ctx context.Context, l execution.EventLifecycleListener) {
-		l.OnFunctionScheduled(ctx, metadata, req.Events)
+		l.OnFunctionScheduled(ctx, metadataSnapshot, reqSnapshot.Events)
 	})
 
 	return &metadata.ID.RunID, &metadata, nil
@@ -1813,8 +1870,10 @@ func (e *executor) updateInvokeSpanWithInvokedRunID(ctx context.Context, l logge
 }
 
 func (e *executor) handleFunctionSkipped(ctx context.Context, req execution.ScheduleRequest, metadata sv2.Metadata, evts []json.RawMessage, reason enums.SkipReason) (*ulid.ULID, *sv2.Metadata, error) {
+	reqSnapshot := cloneScheduleRequest(req)
+	metadataSnapshot := cloneMetadata(metadata)
 	e.runEventLifecycles(ctx, func(ctx context.Context, l execution.EventLifecycleListener) {
-		l.OnFunctionSkipped(ctx, req, metadata, reason)
+		l.OnFunctionSkipped(ctx, reqSnapshot, metadataSnapshot, reason)
 	})
 
 	for _, e := range e.lifecycles {
@@ -2503,6 +2562,9 @@ func (e *executor) checkCancellation(ctx context.Context, md sv2.Metadata, evts 
 
 	// Wait for result to be available within deadline and return, or continue processing asynchronously
 	deadline := 100 * time.Millisecond
+	if e.cancellationCheckDeadline > 0 {
+		deadline = e.cancellationCheckDeadline
+	}
 
 	// Create buffered channel to allow sending even without receiver
 	// but block receive until message is ready
@@ -5152,6 +5214,15 @@ func (e *executor) handleGeneratorInvokeFunction(ctx context.Context, runCtx exe
 		SourceFnID:      runCtx.Metadata().ID.FunctionID.String(),
 		SourceFnVersion: runCtx.Metadata().Config.FunctionVersion,
 	})
+
+	// Merge the invocation payload's two session layers before the event is
+	// published.
+	evt.Event.Meta.ResolveSessions()
+
+	// Validate the sessions after the merge
+	if err := evt.Event.Meta.Sessions.Validate(); err != nil {
+		return execError{err: fmt.Errorf("invalid step.invoke sessions: %w", err), final: true}
+	}
 
 	pause := state.Pause{
 		ID:                  pauseID,

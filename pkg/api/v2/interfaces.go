@@ -52,6 +52,19 @@ type AppSync struct {
 type AppProvider interface {
 	// GetApp returns an app given its external ID OR internal UUID.
 	GetApp(ctx context.Context, identifier string) (App, error)
+	// GetApps returns a stable page of apps.
+	GetApps(ctx context.Context, opts GetAppsOpts) (*GetAppsResult, error)
+}
+
+type GetAppsOpts struct {
+	Cursor   uuid.UUID
+	Limit    int
+	Archived bool
+}
+
+type GetAppsResult struct {
+	Apps    []App
+	HasMore bool
 }
 
 type FunctionScheduler interface {
@@ -76,13 +89,37 @@ type GetRunOpts struct {
 
 type GetRunsOpts struct {
 	EventID       ulid.ULID
-	Cursor        ulid.ULID
+	Cursor        string
 	Limit         int
 	IncludeOutput bool
+	From          *time.Time
+	Until         *time.Time
+	TimeField     RunTimeField
+	Status        []enums.RunStatus
+	AppIDs        []string
+	FunctionIDs   []string
+	IsDeferred    *bool
+	Order         OrderDirection
 }
+
+type RunTimeField int
+
+const (
+	RunTimeFieldQueuedAt RunTimeField = iota
+	RunTimeFieldStartedAt
+	RunTimeFieldEndedAt
+)
+
+type OrderDirection int
+
+const (
+	OrderDirectionDesc OrderDirection = iota
+	OrderDirectionAsc
+)
 
 type RunListItem struct {
 	RunID        ulid.ULID
+	Cursor       string
 	RunStartedAt time.Time
 	EventID      ulid.ULID
 	BatchID      *ulid.ULID
@@ -105,6 +142,7 @@ type RunProvider interface {
 	GetRun(ctx context.Context, runID ulid.ULID, opts GetRunOpts) (*cqrs.FunctionRun, error)
 	GetRuns(ctx context.Context, opts GetRunsOpts) (*GetRunsResult, error)
 	Rerun(ctx context.Context, runID ulid.ULID, opts RerunOpts) (ulid.ULID, error)
+	Cancel(ctx context.Context, runID ulid.ULID) error
 }
 
 type RerunOpts struct {

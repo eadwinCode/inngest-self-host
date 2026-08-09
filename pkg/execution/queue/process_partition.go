@@ -33,7 +33,7 @@ func partitionRequeueExtensionWithJitter() time.Duration {
 //
 // randomOffset allows us to peek jobs out-of-order, and occurs when we hit concurrency key issues
 // such that we can attempt to work on other jobs not blocked by heading concurrency key issues.
-func (q *queueProcessor) ProcessPartition(ctx context.Context, p *QueuePartition, continuationCount uint, randomOffset bool) error {
+func (q *queueProcessor) ProcessPartition(ctx context.Context, p *QueuePartition, continuationCount uint, randomOffset bool, dispatch DispatchFunc) error {
 	l := logger.StdlibLogger(ctx)
 	shard := q.Shard()
 
@@ -286,11 +286,25 @@ func (q *queueProcessor) ProcessPartition(ctx context.Context, p *QueuePartition
 
 	parallel := parallelFn || parallelAccount || isSystemFn
 
+	dispatchForIterator := dispatch
+	if q.runMode.Continuations {
+		dispatchForIterator = func(ctx context.Context, item ProcessItem) (DispatchedItem, error) {
+			dispatched, err := dispatch(ctx, item)
+			if err != nil {
+				return dispatched, err
+			}
+			q.watchDispatchedPartitionItem(ctx, dispatched, p, continuationCount)
+			return dispatched, nil
+		}
+	}
+
 	iter := ProcessorIterator{
 		Partition:            p,
 		Items:                queue,
 		PartitionContinueCtr: continuationCount,
 		Queue:                q,
+		Leaser:               q,
+		Dispatch:             dispatchForIterator,
 		StaticTime:           q.Clock().Now(),
 		Parallel:             parallel,
 	}
@@ -318,7 +332,7 @@ func (q *queueProcessor) ProcessPartition(ctx context.Context, p *QueuePartition
 			l.Warn("error requeuieng partition for random peek", "error", err)
 		}
 
-		return q.ProcessPartition(ctx, p, continuationCount, true)
+		return q.ProcessPartition(ctx, p, continuationCount, true, dispatch)
 	}
 
 	// If we've hit concurrency issues OR we've only hit rate limit issues, re-enqueue the partition
