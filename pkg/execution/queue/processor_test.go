@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,6 +40,27 @@ func (m *mockConsumer) Dequeue(_ context.Context, shardName string, _ QueueItem,
 	return nil
 }
 
+type mockQueueScanner struct {
+	called  atomic.Bool
+	runtime QueueScannerRuntime
+	err     error
+}
+
+func (m *mockQueueScanner) Run(_ context.Context, rt QueueScannerRuntime) error {
+	m.called.Store(true)
+	m.runtime = rt
+	return m.err
+}
+
+type mockScannerShard struct {
+	*mockShardForIterator
+	scanner QueueScanner
+}
+
+func (m *mockScannerShard) Run(ctx context.Context, rt QueueScannerRuntime) error {
+	return m.scanner.Run(ctx, rt)
+}
+
 func TestProcessorWithQueueProducerOverridesDefaultProducer(t *testing.T) {
 	ctx := context.Background()
 	shard := &mockShardForIterator{name: "shard-a"}
@@ -68,6 +90,57 @@ func TestProcessorWithQueueConsumerOverridesDefaultConsumer(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, consumer.called.Load())
 	require.Equal(t, "custom-shard", consumer.shardName.Load())
+}
+
+func TestProcessorRunUsesShardQueueScanner(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scanner := &mockQueueScanner{}
+	shard := &mockScannerShard{
+		mockShardForIterator: &mockShardForIterator{name: "shard-a"},
+		scanner:              scanner,
+	}
+	registry, err := NewSingleShardRegistry(shard)
+	require.NoError(t, err)
+
+	q, err := New(ctx, "test", registry, WithNumWorkers(1))
+	require.NoError(t, err)
+
+	err = q.Run(ctx, func(context.Context, RunInfo, Item) (RunResult, error) {
+		t.Fatal("run function should not be called")
+		return RunResult{}, nil
+	})
+	require.NoError(t, err)
+	require.True(t, scanner.called.Load())
+	require.NotNil(t, scanner.runtime.Leaser)
+	require.NotNil(t, scanner.runtime.Dispatch)
+	require.NotNil(t, scanner.runtime.WorkerSemaphore)
+	require.Same(t, q.Semaphore(), scanner.runtime.WorkerSemaphore)
+}
+
+func TestProcessorRunReturnsQueueScannerError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	scannerErr := errors.New("scanner failed")
+	scanner := &mockQueueScanner{err: scannerErr}
+	shard := &mockScannerShard{
+		mockShardForIterator: &mockShardForIterator{name: "shard-a"},
+		scanner:              scanner,
+	}
+	registry, err := NewSingleShardRegistry(shard)
+	require.NoError(t, err)
+
+	q, err := New(ctx, "test", registry, WithNumWorkers(1))
+	require.NoError(t, err)
+
+	err = q.Run(ctx, func(context.Context, RunInfo, Item) (RunResult, error) {
+		t.Fatal("run function should not be called")
+		return RunResult{}, nil
+	})
+	require.ErrorIs(t, err, scannerErr)
+	require.True(t, scanner.called.Load())
 }
 
 func TestProcessorAccountShardReadsResolveByDefault(t *testing.T) {

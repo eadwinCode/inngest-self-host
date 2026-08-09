@@ -11,11 +11,13 @@ import (
 	apiv2 "github.com/inngest/inngest/pkg/api/v2"
 	"github.com/inngest/inngest/pkg/consts"
 	"github.com/inngest/inngest/pkg/cqrs"
+	"github.com/inngest/inngest/pkg/enums"
 	"github.com/inngest/inngest/pkg/event"
 	"github.com/inngest/inngest/pkg/execution"
 	sv2 "github.com/inngest/inngest/pkg/execution/state/v2"
 	"github.com/inngest/inngest/pkg/inngest"
 	"github.com/oklog/ulid/v2"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -122,6 +124,72 @@ func TestRunProviderRerunUsesRunIDWhenOriginalRunIDIsMissing(t *testing.T) {
 	require.Equal(t, runID, *scheduler.req.OriginalRunID)
 }
 
+func TestRunProviderCancel(t *testing.T) {
+	runID := ulid.MustParse("01HR3ZJ4Z4E0MZ6PRP7Z3A4T00")
+	functionID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+
+	t.Run("cancels an active run", func(t *testing.T) {
+		scheduler := &stubRunProviderScheduler{}
+		provider := &runProvider{
+			data: &stubRunProviderDataReader{run: &cqrs.FunctionRun{
+				RunID:      runID,
+				FunctionID: functionID,
+				Status:     enums.RunStatusRunning,
+			}},
+			scheduler: scheduler,
+		}
+
+		err := provider.Cancel(context.Background(), runID)
+
+		require.NoError(t, err)
+		require.NotNil(t, scheduler.cancelID)
+		require.Equal(t, runID, scheduler.cancelID.RunID)
+		require.Equal(t, functionID, scheduler.cancelID.FunctionID)
+		require.Equal(t, consts.DevServerAccountID, scheduler.cancelID.Tenant.AccountID)
+		require.Equal(t, consts.DevServerEnvID, scheduler.cancelID.Tenant.EnvID)
+		require.NotNil(t, scheduler.cancelReq)
+		require.True(t, scheduler.cancelReq.ForceLifecycleHook)
+	})
+
+	t.Run("rejects non-cancellable runs", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			status enums.RunStatus
+			err    error
+		}{
+			{name: "cancelled", status: enums.RunStatusCancelled, err: apiv2.ErrRunAlreadyCancelled},
+			{name: "completed", status: enums.RunStatusCompleted, err: apiv2.ErrRunEnded},
+			{name: "failed", status: enums.RunStatusFailed, err: apiv2.ErrRunEnded},
+		}
+
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				provider := &runProvider{
+					data:      &stubRunProviderDataReader{run: &cqrs.FunctionRun{Status: test.status}},
+					scheduler: &stubRunProviderScheduler{},
+				}
+
+				err := provider.Cancel(context.Background(), runID)
+
+				require.ErrorIs(t, err, test.err)
+			})
+		}
+	})
+
+	t.Run("returns not found for a missing run", func(t *testing.T) {
+		scheduler := &stubRunProviderScheduler{}
+		provider := &runProvider{
+			data:      &stubRunProviderDataReader{runErr: sql.ErrNoRows},
+			scheduler: scheduler,
+		}
+
+		err := provider.Cancel(context.Background(), runID)
+
+		require.ErrorIs(t, err, apiv2.ErrRunNotFound)
+		require.Nil(t, scheduler.cancelID)
+	})
+}
+
 func TestScoreMetadataLoaderReconstructsFinalizedRunMetadata(t *testing.T) {
 	runID := ulid.MustParse("01KVBJWM98JHAJPC9K5EXVAQTQ")
 	eventID := ulid.MustParse("01KVBJWM98JHAJPC9K5EXVAQTR")
@@ -181,13 +249,151 @@ func TestScoreMetadataLoaderMapsMissingRowsToMetadataNotFound(t *testing.T) {
 	require.ErrorIs(t, err, sv2.ErrMetadataNotFound)
 }
 
+func TestRunProviderGetEventRunsUsesSharedRunList(t *testing.T) {
+	appID := uuid.New()
+	functionID := uuid.New()
+	runID := ulid.Make()
+	eventID := ulid.Make()
+	cursor := "opaque-cursor"
+	startedAt := time.Now().UTC()
+
+	data := &stubRunProviderDataReader{
+		listedRuns: []*cqrs.TraceRun{{
+			RunID:        runID.String(),
+			Cursor:       "next-cursor",
+			AppID:        appID,
+			AppName:      "inngest-ai",
+			FunctionID:   functionID,
+			FunctionSlug: "hello-world",
+			FunctionName: "Hello",
+			StartedAt:    startedAt,
+			Status:       enums.RunStatusCompleted,
+			TriggerIDs:   []string{eventID.String()},
+		}},
+	}
+	provider := &runProvider{data: data}
+
+	result, err := provider.GetRuns(t.Context(), apiv2.GetRunsOpts{
+		EventID: eventID,
+		Cursor:  cursor,
+		Limit:   20,
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Runs, 1)
+	require.NotNil(t, data.listOpts)
+	assert.Equal(t, consts.DevServerAccountID, data.listOpts.Filter.AccountID)
+	assert.Equal(t, consts.DevServerEnvID, data.listOpts.Filter.WorkspaceID)
+	assert.Equal(t, []ulid.ULID{eventID}, data.listOpts.Filter.EventID)
+	assert.Equal(t, cursor, data.listOpts.Cursor)
+	assert.Equal(t, uint(21), data.listOpts.Items)
+	assert.Equal(t, enums.TraceRunTimeQueuedAt, data.listOpts.Filter.TimeField)
+	assert.Equal(t, enums.TraceRunOrderDesc, data.listOpts.Order[0].Direction)
+	assert.Equal(t, "inngest-ai", result.Runs[0].AppID)
+	assert.Equal(t, "hello-world", result.Runs[0].FunctionID)
+	assert.Equal(t, "Hello", result.Runs[0].FunctionName)
+	assert.Equal(t, eventID, result.Runs[0].EventID)
+	assert.Equal(t, "next-cursor", result.Runs[0].Cursor)
+}
+
+func TestRunProviderGetRunsResolvesPublicFilters(t *testing.T) {
+	appID := uuid.New()
+	functionID := uuid.New()
+	runID := ulid.Make()
+	eventID := ulid.Make()
+	startedAt := time.Now().UTC()
+
+	data := &stubRunProviderDataReader{
+		listedRuns: []*cqrs.TraceRun{{
+			RunID:        runID.String(),
+			Cursor:       "next-cursor",
+			AppID:        appID,
+			AppName:      "inngest-ai",
+			FunctionID:   functionID,
+			FunctionSlug: "hello-world",
+			FunctionName: "Hello",
+			StartedAt:    startedAt,
+			Status:       enums.RunStatusCompleted,
+			TriggerIDs:   []string{eventID.String()},
+		}},
+	}
+	provider := &runProvider{data: data}
+	deferred := false
+
+	result, err := provider.GetRuns(t.Context(), apiv2.GetRunsOpts{
+		Limit:       20,
+		AppIDs:      []string{"inngest-ai"},
+		FunctionIDs: []string{"hello-world"},
+		IsDeferred:  &deferred,
+		Order:       apiv2.OrderDirectionAsc,
+		TimeField:   apiv2.RunTimeFieldStartedAt,
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Runs, 1)
+	require.NotNil(t, data.listOpts)
+	assert.Equal(t, []string{"inngest-ai"}, data.listOpts.Filter.AppName)
+	assert.Equal(t, []string{"hello-world"}, data.listOpts.Filter.FunctionSlug)
+	assert.Equal(t, &deferred, data.listOpts.Filter.IsDeferred)
+	assert.Equal(t, uint(21), data.listOpts.Items)
+	assert.Equal(t, enums.TraceRunTimeStartedAt, data.listOpts.Filter.TimeField)
+	assert.Equal(t, enums.TraceRunOrderAsc, data.listOpts.Order[0].Direction)
+	assert.Equal(t, "inngest-ai", result.Runs[0].AppID)
+	assert.Equal(t, "hello-world", result.Runs[0].FunctionID)
+	assert.Equal(t, "Hello", result.Runs[0].FunctionName)
+	assert.Equal(t, eventID, result.Runs[0].EventID)
+	assert.Equal(t, "next-cursor", result.Runs[0].Cursor)
+}
+
+func TestRunProviderGetRunsSkipsUnknownPublicFilter(t *testing.T) {
+	data := &stubRunProviderDataReader{}
+	provider := &runProvider{data: data}
+
+	result, err := provider.GetRuns(t.Context(), apiv2.GetRunsOpts{
+		Limit:  20,
+		AppIDs: []string{"unknown-app"},
+	})
+	require.NoError(t, err)
+	require.Empty(t, result.Runs)
+	require.NotNil(t, data.listOpts)
+	assert.Equal(t, []string{"unknown-app"}, data.listOpts.Filter.AppName)
+}
+
+func TestCQRSRunTimeField(t *testing.T) {
+	tests := []struct {
+		name     string
+		field    apiv2.RunTimeField
+		expected enums.TraceRunTime
+	}{
+		{name: "queued", field: apiv2.RunTimeFieldQueuedAt, expected: enums.TraceRunTimeQueuedAt},
+		{name: "started", field: apiv2.RunTimeFieldStartedAt, expected: enums.TraceRunTimeStartedAt},
+		{name: "ended", field: apiv2.RunTimeFieldEndedAt, expected: enums.TraceRunTimeEndedAt},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual, err := cqrsRunTimeField(tt.field)
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, actual)
+		})
+	}
+
+	_, err := cqrsRunTimeField(apiv2.RunTimeField(99))
+	require.ErrorContains(t, err, "unsupported run time field")
+}
+
 type stubRunProviderDataReader struct {
-	run    *cqrs.FunctionRun
-	runErr error
-	fn     *cqrs.Function
-	fnErr  error
-	evt    *cqrs.Event
-	evtErr error
+	run        *cqrs.FunctionRun
+	runErr     error
+	fn         *cqrs.Function
+	fnErr      error
+	evt        *cqrs.Event
+	evtErr     error
+	listedRuns []*cqrs.TraceRun
+	listOpts   *cqrs.GetTraceRunOpt
+}
+
+func (s *stubRunProviderDataReader) GetRuns(ctx context.Context, opts cqrs.GetTraceRunOpt) ([]*cqrs.TraceRun, error) {
+	s.listOpts = &opts
+	return s.listedRuns, nil
 }
 
 func (s *stubRunProviderDataReader) GetSpansByRunID(ctx context.Context, runID ulid.ULID) (*cqrs.OtelSpan, error) {
@@ -216,8 +422,11 @@ func (s *stubRunProviderDataReader) GetEventByInternalID(ctx context.Context, in
 }
 
 type stubRunProviderScheduler struct {
-	runID ulid.ULID
-	req   *execution.ScheduleRequest
+	runID     ulid.ULID
+	req       *execution.ScheduleRequest
+	cancelID  *sv2.ID
+	cancelReq *execution.CancelRequest
+	cancelErr error
 }
 
 func (s *stubRunProviderScheduler) Schedule(ctx context.Context, req execution.ScheduleRequest) (*ulid.ULID, *sv2.Metadata, error) {
@@ -225,6 +434,12 @@ func (s *stubRunProviderScheduler) Schedule(ctx context.Context, req execution.S
 	return &s.runID, nil, nil
 }
 
+func (s *stubRunProviderScheduler) Cancel(ctx context.Context, id sv2.ID, req execution.CancelRequest) error {
+	s.cancelID = &id
+	s.cancelReq = &req
+	return s.cancelErr
+}
+
 var _ runProviderDataReader = (*stubRunProviderDataReader)(nil)
-var _ apiv2.FunctionScheduler = (*stubRunProviderScheduler)(nil)
+var _ runProviderExecutor = (*stubRunProviderScheduler)(nil)
 var _ event.TrackedEvent = (*cqrs.Event)(nil)

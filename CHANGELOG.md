@@ -2,6 +2,108 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.41.0] - 2026-08-03
+
+### 🚀 Features
+
+- *(ai-overview)* Add insights-backed AI dashboard (#4662)
+- *(ui)* Nudge metadata usage in run details (#4683)
+
+### 🐛 Bug Fixes
+
+- *(connect)* Prevent connection state regression during gateway draining (#4685)
+- *(queue)* Isolate unavailable shards (#4688)
+- *(connect)* Make lease renewal idempotent after lost ACKs (#4687)
+
+## [v1.40.0] - 2026-07-30
+
+### 🚀 Features
+
+- *(mcp)* Generate mcp tools from rest api v2 (#4674)
+- *(api)* Add v2 apps list endpoint (#4657)
+
+### 🐛 Bug Fixes
+
+- *(epxressions)* Add support for falsy terns (#4676)
+- *(queue)* Correct reversed errors.Is arguments for ErrQueueItemNotFound (#4679)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* V1.40.0 (#4677)
+
+## [v1.39.0] - 2026-07-28
+
+### 🚀 Features
+
+- *(api)* Rest v2 rerun from step (#4645)
+- *(metadata)* Augment incoming ai metadata with cost estimates (#4661)
+- *(api)* V2 api cancel run (#4638)
+
+### 🐛 Bug Fixes
+
+- *(cli)* Improve cli timestamp arg handling (#4650)
+- Use snapshots to handle map race access (#4653)
+- *(queue)* Skip constraint lease on missing account (#4604)
+- Race creating workflow and checkpointing durable endpoint step (#4668)
+- *(executor)* Recover from panics in event lifecycle listeners (#4672)
+
+### 🚜 Refactor
+
+- *(queue)* Add shard scanner boundary (#4655)
+- *(queue)* Add scanner runtime (#4665)
+- *(queue)* Expose available worker count (#4666)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(logging)* Add logging middleware for API (#4646)
+- Make cancellation deadline configurable (#4659)
+- *(state)* Add primitives for cross-backend run state migration (#4654)
+- *(release)* V1.39.0 (#4651)
+
+## [v1.38.1] - 2026-07-21
+
+### 🐛 Bug Fixes
+
+- *(api)* Clarify run list commands and docs (#4647)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* V1.38.1 (#4648)
+
+## [v1.38.0] - 2026-07-21
+
+### 🚀 Features
+
+- *(dashboard)* Add Sandboxes waitlist (#4611)
+- *(queue)* Define grpc service interfaces for queue producer and consumer (#4610)
+- *(queue)* Route RequeueByJobID through producer (#4613)
+- Enforce one-year maximum duration for sleep and wait-for-event (#4628)
+- Normalize and instrument AI feature empty state pages (#4620)
+- *(cli)* Add API command usage metrics (#4642)
+- *(api)* Add v2 runs list endpoints (#4621)
+
+### 🐛 Bug Fixes
+
+- Fix the ordering and queue time of async opcodes (#4608)
+- *(queue)* Expose partition size on job queue reader (#4619)
+- *(insights ai)* Attribute Insights cost/latency/token scores to their experiment variant (bump inngest 4.13.0) (#4641)
+
+### 🚜 Refactor
+
+- *(queue)* Route processor dequeue and requeue through queue interfaces (#4639)
+- *(runs)* Consolidate oss runs queries (#4623)
+
+### 📚 Documentation
+
+- EXE-2021 Add CLI callout to API docs (#4618)
+- Add guidance on Postgres retention for self-hosting (#4357)
+
+### ⚙️ Miscellaneous Tasks
+
+- Add event lifecycle hooks (#4624)
+- Align auto-labels with Linear (#4634)
+- *(release)* V1.38.0 (#4615)
+
 ## [v1.37.0] - 2026-07-14
 
 ### 🚀 Features
@@ -46,6 +148,7 @@ All notable changes to this project will be documented in this file.
 - *(tygo-collect)* Gofmt generated output (#4586)
 - Remove unused TotalSystemQueueDepth from QueueManager interface (#4574)
 - Cache our pnpm installation (#4588)
+- *(release)* V1.37.0 (#4587)
 
 ## [v1.36.0] - 2026-07-08
 

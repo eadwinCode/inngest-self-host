@@ -26,6 +26,12 @@ func (m *mockAppProvider) GetApp(ctx context.Context, identifier string) (App, e
 	return app, args.Error(1)
 }
 
+func (m *mockAppProvider) GetApps(ctx context.Context, opts GetAppsOpts) (*GetAppsResult, error) {
+	args := m.Called(ctx, opts)
+	result, _ := args.Get(0).(*GetAppsResult)
+	return result, args.Error(1)
+}
+
 type mockFunctionProvider struct {
 	mock.Mock
 }
@@ -68,6 +74,10 @@ func (m *mockRunProvider) Rerun(ctx context.Context, runID ulid.ULID, opts Rerun
 	args := m.Called(ctx, runID, opts)
 	runID, _ = args.Get(0).(ulid.ULID)
 	return runID, args.Error(1)
+}
+
+func (m *mockRunProvider) Cancel(ctx context.Context, runID ulid.ULID) error {
+	return m.Called(ctx, runID).Error(0)
 }
 
 type mockFunctionTraceReader struct {

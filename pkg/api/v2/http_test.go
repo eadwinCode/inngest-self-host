@@ -1,6 +1,7 @@
 package apiv2
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -189,6 +190,54 @@ func TestHTTPGateway_RunEnumsUseShortJSONNames(t *testing.T) {
 	require.Equal(t, "COMPLETED", run["status"])
 }
 
+func TestHTTPGateway_RunListRoutes(t *testing.T) {
+	t.Run("binds list filters", func(t *testing.T) {
+		isDeferred := true
+		runs := &mockRunProvider{}
+		runs.On("GetRuns", mock.Anything, GetRunsOpts{
+			Limit:       3,
+			TimeField:   RunTimeFieldStartedAt,
+			Status:      []enums.RunStatus{enums.RunStatusCompleted, enums.RunStatusFailed},
+			AppIDs:      []string{"my-app"},
+			FunctionIDs: []string{"test-fn"},
+			IsDeferred:  &isDeferred,
+			Order:       OrderDirectionAsc,
+		}).Return(&GetRunsResult{}, nil).Once()
+
+		handler, err := newTestHTTPHandler(t.Context(), ServiceOptions{Runs: runs}, HTTPHandlerOptions{})
+		require.NoError(t, err)
+		t.Cleanup(func() { runs.AssertExpectations(t) })
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v2/runs?limit=3&timeField=STARTED_AT&status=COMPLETED&status=FAILED&appId=my-app&functionId=test-fn&isDeferred=true&order=ASC", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	})
+
+	t.Run("binds function path", func(t *testing.T) {
+		runs := &mockRunProvider{}
+		runs.On("GetRuns", mock.Anything, GetRunsOpts{
+			Limit:       defaultRunsLimit,
+			TimeField:   RunTimeFieldQueuedAt,
+			Status:      []enums.RunStatus{},
+			AppIDs:      []string{"my-app"},
+			FunctionIDs: []string{"test-fn"},
+			Order:       OrderDirectionDesc,
+		}).Return(&GetRunsResult{}, nil).Once()
+
+		handler, err := newTestHTTPHandler(t.Context(), ServiceOptions{Runs: runs}, HTTPHandlerOptions{})
+		require.NoError(t, err)
+		t.Cleanup(func() { runs.AssertExpectations(t) })
+
+		req := httptest.NewRequest(http.MethodGet, "/api/v2/apps/my-app/functions/test-fn/runs", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	})
+}
+
 func TestHTTPGateway_Rerun(t *testing.T) {
 	ctx := context.Background()
 	runID := ulid.MustParse("01hp1zx8m3ng9vp6qn0xk7j4cy")
@@ -218,9 +267,10 @@ func TestHTTPGateway_Rerun(t *testing.T) {
 	require.Equal(t, newRunID.String(), data["runId"])
 }
 
-func TestHTTPGateway_RerunFromStepNotImplemented(t *testing.T) {
+func TestHTTPGateway_RerunFromStep(t *testing.T) {
 	ctx := context.Background()
 	runID := ulid.MustParse("01hp1zx8m3ng9vp6qn0xk7j4cy")
+	newRunID := ulid.MustParse("01hp1zx8m3ng9vp6qn0xk7j4d0")
 	body, err := json.Marshal(map[string]any{
 		"fromStep": map[string]any{
 			"stepId": "step-1",
@@ -232,6 +282,12 @@ func TestHTTPGateway_RerunFromStepNotImplemented(t *testing.T) {
 	require.NoError(t, err)
 
 	rerun := &mockRunProvider{}
+	rerun.On("Rerun", mock.Anything, runID, RerunOpts{
+		FromStep: &RerunFromStep{
+			StepID: "step-1",
+			Input:  json.RawMessage(`[{"foo":"bar"}]`),
+		},
+	}).Return(newRunID, nil).Once()
 	handler, err := newTestHTTPHandler(ctx, ServiceOptions{Runs: rerun}, HTTPHandlerOptions{})
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -245,13 +301,83 @@ func TestHTTPGateway_RerunFromStepNotImplemented(t *testing.T) {
 
 	handler.ServeHTTP(rec, req)
 
-	require.Equal(t, http.StatusNotImplemented, rec.Code)
+	require.Equal(t, http.StatusOK, rec.Code)
 
-	var response errorResponse
+	var response map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
-	require.Len(t, response.Errors, 1)
-	require.Equal(t, apiv2base.ErrorNotImplemented, response.Errors[0].Code)
-	require.Equal(t, "Rerun from step is not yet implemented", response.Errors[0].Message)
+	data := response["data"].(map[string]any)
+	require.Equal(t, newRunID.String(), data["runId"])
+}
+
+func TestHTTPGateway_RerunFromStepErrors(t *testing.T) {
+	runID := ulid.MustParse("01hp1zx8m3ng9vp6qn0xk7j4cy")
+	tests := []struct {
+		name    string
+		stepID  string
+		err     error
+		message string
+	}{
+		{name: "missing step", stepID: "missing", err: ErrRerunStepNotFound, message: "Step not found in original run"},
+		{name: "ambiguous step", stepID: "duplicate", err: ErrRerunStepAmbiguous, message: "Step name matches multiple steps in original run"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rerun := &mockRunProvider{}
+			rerun.On("Rerun", mock.Anything, runID, RerunOpts{
+				FromStep: &RerunFromStep{StepID: tt.stepID},
+			}).Return(ulid.ULID{}, tt.err).Once()
+			t.Cleanup(func() {
+				rerun.AssertExpectations(t)
+			})
+
+			handler, err := newTestHTTPHandler(context.Background(), ServiceOptions{Runs: rerun}, HTTPHandlerOptions{})
+			require.NoError(t, err)
+			body, err := json.Marshal(map[string]any{
+				"fromStep": map[string]any{"stepId": tt.stepID},
+			})
+			require.NoError(t, err)
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v2/runs/"+runID.String()+"/rerun", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+			var response errorResponse
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+			require.Equal(t, apiv2base.ErrorInvalidRequest, response.Errors[0].Code)
+			require.Equal(t, tt.message, response.Errors[0].Message)
+		})
+	}
+}
+
+func TestHTTPGateway_CancelRun(t *testing.T) {
+	ctx := context.Background()
+	runID := ulid.MustParse("01hp1zx8m3ng9vp6qn0xk7j4cy")
+
+	provider := &mockRunProvider{}
+	provider.On("Cancel", mock.Anything, runID).Return(nil).Once()
+
+	handler, err := newTestHTTPHandler(ctx, ServiceOptions{Runs: provider}, HTTPHandlerOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		provider.AssertExpectations(t)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/runs/"+runID.String()+"/cancel", nil)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+	data := response["data"].(map[string]any)
+	require.Equal(t, runID.String(), data["runId"])
 }
 
 func TestHTTPGateway_GetApp(t *testing.T) {
@@ -308,6 +434,49 @@ func TestHTTPGateway_GetApp(t *testing.T) {
 	require.NotContains(t, data, "isArchived")
 	require.NotContains(t, latestSync, "framework")
 	require.NotContains(t, latestSync, "error")
+}
+
+func TestHTTPGateway_GetApps(t *testing.T) {
+	ctx := context.Background()
+	appID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+	apps := &mockAppProvider{}
+	apps.On("GetApps", mock.Anything, GetAppsOpts{
+		Limit:    1,
+		Archived: true,
+	}).Return(&GetAppsResult{
+		Apps: []App{{
+			ID:         "my-app",
+			InternalID: appID,
+			Name:       "My app",
+		}},
+		HasMore: true,
+	}, nil).Once()
+
+	handler, err := newTestHTTPHandler(ctx, ServiceOptions{Apps: apps}, HTTPHandlerOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		apps.AssertExpectations(t)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/apps?limit=1&archived=true", nil)
+	req.Header.Set("Accept", "*/*")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	data := body["data"].([]any)
+	item := data[0].(map[string]any)
+	require.Equal(t, "my-app", item["id"])
+	require.Equal(t, "My app", item["name"])
+
+	page := body["page"].(map[string]any)
+	require.True(t, page["hasMore"].(bool))
+	require.Equal(t, appID.String(), page["cursor"])
+	require.Equal(t, float64(1), page["limit"])
 }
 
 func TestHTTPGateway_GetFunction(t *testing.T) {

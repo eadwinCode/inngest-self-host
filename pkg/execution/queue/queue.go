@@ -47,10 +47,50 @@ type RunInfo struct {
 // Item's retry policy.
 type RunFunc func(context.Context, RunInfo, Item) (RunResult, error)
 
+type DispatchFunc func(ctx context.Context, item ProcessItem) (DispatchedItem, error)
+
+type QueueItemLeaser interface {
+	LeaseItem(ctx context.Context, req LeaseItemRequest, dispatch DispatchFunc) (LeaseItemResult, error)
+}
+
+type LeaseItemRequest struct {
+	Item                       *QueueItem
+	Priority                   uint
+	ContinueCount              uint
+	EarliestPeekTimeFallbackMS int64
+	StaticTime                 time.Time
+}
+
+type LeaseItemStatus int
+
+const (
+	LeaseItemStatusNone LeaseItemStatus = iota
+	LeaseItemStatusDispatched
+	LeaseItemStatusAlreadyLeased
+	LeaseItemStatusNoWorkerCapacity
+	LeaseItemStatusThrottled
+	LeaseItemStatusConcurrencyLimited
+	LeaseItemStatusCustomConcurrencyLimited
+	LeaseItemStatusSemaphoreLimited
+	LeaseItemStatusNotFound
+	LeaseItemStatusLeaseContention
+	LeaseItemStatusLeaseError
+)
+
+type LeaseItemResult struct {
+	Status     LeaseItemStatus
+	Err        error
+	RetryAfter time.Time
+}
+
 type RunResult struct {
 	// ScheduledImmediateJob indicates whether this run function scheduled another job
 	// in the same partition for immediate consumption.
 	ScheduledImmediateJob bool
+}
+
+type ProcessItemResult struct {
+	RunResult RunResult
 }
 
 type EnqueueOpts struct {
