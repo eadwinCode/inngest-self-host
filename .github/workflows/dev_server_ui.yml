@@ -6,10 +6,6 @@ on:
     paths:
       - "ui/**"
       - "pkg/coreapi/**/*.graphql"
-  pull_request:
-    paths:
-      - "ui/**"
-      - "pkg/coreapi/**/*.graphql"
 
 jobs:
   build:

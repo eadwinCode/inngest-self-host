@@ -5,9 +5,6 @@ on:
     branches: [main]
     paths:
       - "ui/packages/components/**"
-  pull_request:
-    paths:
-      - "ui/packages/components/**"
 
 jobs:
   build:
