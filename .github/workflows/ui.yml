@@ -5,9 +5,6 @@ on:
     branches: [main]
     paths:
       - "ui/**"
-  pull_request:
-    paths:
-      - "ui/**"
 
 jobs:
   # A flag we can use to warn us of critical known issues in the chain. This
@@ -29,7 +26,3 @@ jobs:
       # here and only check what's shipped directly by us.
       - run: pnpm audit --audit-level=critical --prod --no-optional --ignore-registry-errors
         working-directory: ui
-              
-
-
-
