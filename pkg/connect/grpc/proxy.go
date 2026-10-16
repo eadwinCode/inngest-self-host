@@ -146,7 +146,7 @@ func (i *grpcConnector) Proxy(ctx, traceCtx context.Context, opts ProxyOpts) (*c
 		"run_id", opts.Data.RunId,
 		"req_id", opts.Data.RequestId,
 		"function_id", opts.Data.FunctionId,
-		"app_id", opts.Data.AppId,
+		"fn_slug", opts.Data.FunctionSlug,
 	)
 
 	traceCtx, span := i.tracer.NewUserSpan(traceCtx, "Proxy", opts.AccountID, opts.EnvID, opts.FunctionID)
@@ -164,12 +164,20 @@ func (i *grpcConnector) Proxy(ctx, traceCtx context.Context, opts ProxyOpts) (*c
 		// to have already sent a response and completed the request.
 		resp, err := i.stateManager.GetResponse(ctx, opts.EnvID, opts.Data.RequestId)
 		if err != nil {
+			metrics.IncrConnectProxyResponseBufferReadCounter(ctx, 1, metrics.CounterOpt{
+				PkgName: pkgName,
+				Tags:    map[string]any{"outcome": "error"},
+			})
 			span.RecordError(err)
 			l.ReportError(err, "could not check for buffered response")
 			return nil, fmt.Errorf("could not check for buffered response: %w", err)
 		}
 
 		if resp != nil {
+			metrics.IncrConnectProxyResponseBufferReadCounter(ctx, 1, metrics.CounterOpt{
+				PkgName: pkgName,
+				Tags:    map[string]any{"outcome": "hit"},
+			})
 			// We have a response already, return it
 			l.Debug("found buffered response")
 
@@ -220,25 +228,6 @@ func (i *grpcConnector) Proxy(ctx, traceCtx context.Context, opts ProxyOpts) (*c
 		opts.Data.UserTraceCtx = marshaled
 	}
 
-	{
-		// Receive worker acknowledgement for o11y
-		ch := i.gatewayGRPCManager.SubscribeWorkerAck(ctx, opts.Data.RequestId)
-		defer i.gatewayGRPCManager.UnsubscribeWorkerAck(ctx, opts.Data.RequestId)
-
-		go func() {
-			<-ch
-
-			span.AddEvent("WorkerAck")
-			metrics.HistogramConnectProxyAckTime(ctx, time.Since(proxyStartTime).Milliseconds(), metrics.HistogramOpt{
-				PkgName: pkgName,
-				Tags: map[string]any{
-					"kind":      "worker",
-					"transport": "grpc",
-				},
-			})
-		}()
-	}
-
 	// Await SDK response forwarded by gateway
 
 	reply := &connectpb.SDKResponse{}
@@ -258,12 +247,20 @@ func (i *grpcConnector) Proxy(ctx, traceCtx context.Context, opts ProxyOpts) (*c
 
 			resp, err := i.stateManager.GetResponse(ctx, opts.EnvID, opts.Data.RequestId)
 			if err != nil {
+				metrics.IncrConnectProxyResponseBufferReadCounter(ctx, 1, metrics.CounterOpt{
+					PkgName: pkgName,
+					Tags:    map[string]any{"outcome": "error"},
+				})
 				span.RecordError(err)
 				l.ReportError(err, "could not check for response")
 				continue
 			}
 
 			if resp != nil {
+				metrics.IncrConnectProxyResponseBufferReadCounter(ctx, 1, metrics.CounterOpt{
+					PkgName: pkgName,
+					Tags:    map[string]any{"outcome": "hit"},
+				})
 				span.AddEvent("ReplyReceivedPoll")
 
 				l.Debug("received response via polling")
@@ -288,7 +285,12 @@ func (i *grpcConnector) Proxy(ctx, traceCtx context.Context, opts ProxyOpts) (*c
 
 			close(replySubscribed)
 
-			reply = <-replyReceived
+			select {
+			case reply = <-replyReceived:
+			case <-ctx.Done():
+				// Unsubscribe never closes the channel.
+				return
+			}
 
 			span.AddEvent("ReplyReceivedGRPC")
 			metrics.IncrConnectGatewayGRPCReplyCounter(ctx, 1, metrics.CounterOpt{})
@@ -414,14 +416,13 @@ func (i *grpcConnector) Proxy(ctx, traceCtx context.Context, opts ProxyOpts) (*c
 			span.RecordError(err)
 			l.ReportError(err, "could not assign request lease to worker", logger.WithErrorReportTags(map[string]string{
 				"instance_id": routedInstanceID,
-				"request_id":  opts.Data.RequestId,
 				"gateway_id":  route.GatewayID.String(),
 			}))
 
 		}
 
 		// Trace the request lease assignment
-		l.Trace("assigned request lease to worker", "instance_id", routedInstanceID, "request_id", opts.Data.RequestId, "gateway_id", route.GatewayID.String())
+		l.Trace("assigned request lease to worker", "instance_id", routedInstanceID, "gateway_id", route.GatewayID.String())
 
 		transport := "grpc"
 
@@ -433,9 +434,6 @@ func (i *grpcConnector) Proxy(ctx, traceCtx context.Context, opts ProxyOpts) (*c
 				"attempt", forwardAttempt,
 				"gateway_id", route.GatewayID.String(),
 				"conn_id", route.ConnectionID.String(),
-				"req_id", opts.Data.RequestId,
-				"run_id", opts.Data.RunId,
-				"fn_slug", opts.Data.FunctionSlug,
 			)
 
 			// Forward now awaits the SDK to ack a job, so an error means that it's likely
@@ -457,7 +455,7 @@ func (i *grpcConnector) Proxy(ctx, traceCtx context.Context, opts ProxyOpts) (*c
 
 			route, err = routing.GetRoute(ctx, i.stateManager, i.rnd, i.tracer, l, opts.Data)
 			if err != nil {
-				l.Warn("re-route failed", "attempt", forwardAttempt+1, "err", err, "req_id", opts.Data.RequestId, "run_id", opts.Data.RunId)
+				l.Warn("re-route failed", "attempt", forwardAttempt+1, "err", err)
 				break
 			}
 			routedInstanceID = route.InstanceID
@@ -481,6 +479,7 @@ func (i *grpcConnector) Proxy(ctx, traceCtx context.Context, opts ProxyOpts) (*c
 			return nil, fmt.Errorf("failed to route request to gateway: %w", err)
 		}
 
+		span.AddEvent("WorkerAck")
 		metrics.HistogramConnectProxyAckTime(ctx, time.Since(proxyStartTime).Milliseconds(), metrics.HistogramOpt{
 			PkgName: pkgName,
 			Tags: map[string]any{

@@ -118,6 +118,14 @@ JOIN apps ON apps.id = functions.app_id
 WHERE functions.archived_at IS NULL
 AND apps.archived_at IS NULL;
 
+-- name: GetFunctionsBySlugs :many
+SELECT functions.*
+FROM functions
+JOIN apps ON apps.id = functions.app_id
+WHERE functions.slug IN (sqlc.slice('slugs'))
+AND functions.archived_at IS NULL
+AND apps.archived_at IS NULL;
+
 -- name: GetAppFunctions :many
 SELECT * FROM functions WHERE app_id = ? AND archived_at IS NULL;
 
@@ -477,54 +485,6 @@ SELECT
 FROM spans
 WHERE run_id = ?
 GROUP BY run_id, trace_id, dynamic_span_id, parent_span_id
-ORDER BY start_time;
-
--- name: GetSpansByDebugRunID :many
-SELECT
-  trace_id,
-  run_id,
-  debug_session_id,
-  dynamic_span_id,
-  MIN(start_time) as start_time,
-  MAX(end_time) AS end_time,
-  parent_span_id,
-  json_group_array(json_object(
-    'span_id', span_id,
-    'start_time', start_time,
-    'end_time', end_time,
-    'name', name,
-    'attributes', attributes,
-    'links', links,
-    'output_span_id', CASE WHEN output IS NOT NULL THEN span_id ELSE NULL END,
-    'input_span_id', CASE WHEN input IS NOT NULL THEN span_id ELSE NULL END
-  )) AS span_fragments
-FROM spans
-WHERE debug_run_id = ?
-GROUP BY trace_id, run_id, debug_session_id, dynamic_span_id, parent_span_id
-ORDER BY start_time;
-
--- name: GetSpansByDebugSessionID :many
-SELECT
-  trace_id,
-  run_id,
-  debug_run_id,
-  dynamic_span_id,
-  MIN(start_time) as start_time,
-  MAX(end_time) AS end_time,
-  parent_span_id,
-  json_group_array(json_object(
-    'span_id', span_id,
-    'start_time', start_time,
-    'end_time', end_time,
-    'name', name,
-    'attributes', attributes,
-    'links', links,
-    'output_span_id', CASE WHEN output IS NOT NULL THEN span_id ELSE NULL END,
-    'input_span_id', CASE WHEN input IS NOT NULL THEN span_id ELSE NULL END
-  )) AS span_fragments
-FROM spans
-WHERE debug_session_id = ?
-GROUP BY trace_id, run_id, debug_run_id, dynamic_span_id, parent_span_id
 ORDER BY start_time;
 
 -- name: GetSpanOutput :many

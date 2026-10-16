@@ -6,6 +6,7 @@ import { Pill } from '@inngest/components/Pill';
 import { SelectGroup, type Option } from '@inngest/components/Select/Select';
 import { TableFilter } from '@inngest/components/Table';
 import { OptionalTooltip } from '@inngest/components/Tooltip/OptionalTooltip';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@inngest/components/Tooltip/Tooltip';
 import { DEFAULT_TIME } from '@inngest/components/hooks/useCalculatedStartTime';
 import {
   FunctionRunTimeField,
@@ -15,9 +16,16 @@ import {
 } from '@inngest/components/types/functionRun';
 import { cn } from '@inngest/components/utils/classNames';
 import { durationToString, parseDuration } from '@inngest/components/utils/date';
-import { RiArrowRightUpLine, RiRefreshLine, RiSearchLine } from '@remixicon/react';
+import {
+  RiArrowRightUpLine,
+  RiCloseCircleLine,
+  RiInformationLine,
+  RiPlayCircleLine,
+  RiRefreshLine,
+  RiSearchLine,
+} from '@remixicon/react';
 import { type VisibilityState } from '@tanstack/react-table';
-import useLocalStorage from 'react-use/lib/useLocalStorage';
+import useLocalStorage from 'react-use/esm/useLocalStorage';
 
 import CodeSearch from '../CodeSearch/CodeSearch';
 import type { RangeChangeProps } from '../DatePicker/RangePicker';
@@ -32,6 +40,7 @@ import {
   useValidatedSearchParam,
 } from '../hooks/useSearchParams';
 import type { Features } from '../types/features';
+import { ProgressiveSearchStatus } from './ProgressiveSearchStatus';
 import RunsStatusFilter from './RunsStatusFilter';
 import RunsTable from './RunsTable';
 import RunsTypeFilter from './RunsTypeFilter';
@@ -41,7 +50,7 @@ import type { Run, ViewScope } from './types';
 type Props = {
   data: Run[];
   defaultVisibleColumns?: ColumnID[];
-  features: Pick<Features, 'history' | 'tracesPreview' | 'isDeferred'>;
+  features: Pick<Features, 'history' | 'isDeferred'>;
   getTrigger: React.ComponentProps<typeof RunDetailsV4>['getTrigger'];
   hasMore: boolean;
   isLoadingInitial: boolean;
@@ -56,7 +65,19 @@ type Props = {
   totalCount: number | undefined;
   searchError?: Error;
   error?: Error | null;
+  progressiveSearch?: {
+    phase: 'searching' | 'paused' | 'cancelled' | 'complete' | 'error';
+    hasCompletedScanResponse: boolean;
+    searchedThrough?: Date;
+    cancel: () => void;
+    resume: () => void;
+    insightsHref?: string;
+  };
   infiniteScrollTrigger?: (containerRef: HTMLDivElement | null) => React.ReactNode;
+  // Rendered above the filter row, inside the sticky header so it stays put
+  // while the run list scrolls. Cloud passes an account-level banner here; the
+  // dev server has no such data and passes nothing.
+  banner?: React.ReactNode;
   // When set, the CEL search button is hidden once `totalCount` reaches this
   // threshold (unless the user already has an active query, so they're not
   // stranded without a "Hide search" toggle). Used by self-hosted deployments
@@ -83,8 +104,10 @@ export function RunsPage({
   totalCount,
   searchError,
   error,
+  progressiveSearch,
   infiniteScrollTrigger,
   searchLimit,
+  banner,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const columns = useScopedColumns(scope);
@@ -256,7 +279,7 @@ export function RunsPage({
         </div>
       );
     },
-    [getTrigger, pollInterval, features.tracesPreview]
+    [getTrigger, pollInterval]
   );
 
   const options = useMemo(() => {
@@ -282,6 +305,7 @@ export function RunsPage({
   return (
     <main className="bg-canvasBase text-basis no-scrollbar flex flex-1 flex-col overflow-hidden focus-visible:outline-none">
       <div className="bg-canvasBase sticky top-0 z-10 flex flex-col">
+        {banner}
         <div className="flex h-11 items-center justify-between gap-1.5 px-3">
           <div className="flex items-center gap-1.5">
             {/* CEL search scans the returned run set and gets prohibitively slow on large pages.
@@ -371,7 +395,29 @@ export function RunsPage({
             )}
           </div>
           <div className="flex items-center gap-2">
-            <TotalCount totalCount={totalCount} />
+            {progressiveSearch ? (
+              <div className="text-muted flex items-center gap-1 text-xs">
+                <ProgressiveSearchStatus
+                  compact
+                  phase={progressiveSearch.phase}
+                  hasCompletedScanResponse={progressiveSearch.hasCompletedScanResponse}
+                  matchCount={data.length}
+                  searchedThrough={progressiveSearch.searchedThrough}
+                />
+                <Tooltip>
+                  <TooltipTrigger aria-label="About progressive run search">
+                    <RiInformationLine className="h-4 w-4" />
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-xs whitespace-normal text-left">
+                    For performance, CEL search scans runs incrementally. The total remains partial
+                    until the entire time range is scanned, which may be impractical for large data
+                    sets. Search with Insights when you want to explore runs using SQL.
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+            ) : (
+              <TotalCount totalCount={totalCount} />
+            )}
             <TableFilter
               columnVisibility={columnVisibility}
               setColumnVisibility={setColumnVisibility}
@@ -420,7 +466,50 @@ export function RunsPage({
           scope={scope}
         />
         {infiniteScrollTrigger?.(containerRef.current)}
-        {!hasMore && data.length > 1 && (
+        {progressiveSearch && (
+          <div className="border-subtle mx-3 mt-2 flex min-h-24 flex-col items-center justify-center gap-3 rounded border px-4 py-4">
+            <p className="text-muted text-center text-xs">
+              <ProgressiveSearchStatus
+                phase={progressiveSearch.phase}
+                hasCompletedScanResponse={progressiveSearch.hasCompletedScanResponse}
+                matchCount={data.length}
+                searchedThrough={progressiveSearch.searchedThrough}
+              />
+            </p>
+            <div className="flex items-center gap-2">
+              {progressiveSearch.phase === 'searching' ? (
+                <Button
+                  appearance="outlined"
+                  kind="secondary"
+                  label="Cancel search"
+                  icon={<RiCloseCircleLine />}
+                  iconSide="left"
+                  onClick={progressiveSearch.cancel}
+                />
+              ) : progressiveSearch.phase !== 'complete' ? (
+                <Button
+                  appearance="outlined"
+                  kind="secondary"
+                  label="Continue searching"
+                  icon={<RiPlayCircleLine />}
+                  iconSide="left"
+                  onClick={progressiveSearch.resume}
+                />
+              ) : null}
+              {progressiveSearch.phase !== 'searching' && progressiveSearch.insightsHref ? (
+                <Button
+                  appearance="outlined"
+                  kind="secondary"
+                  label="Search with Insights instead"
+                  icon={<RiArrowRightUpLine />}
+                  iconSide="left"
+                  href={progressiveSearch.insightsHref}
+                />
+              ) : null}
+            </div>
+          </div>
+        )}
+        {!progressiveSearch && !hasMore && data.length > 1 && (
           <div className="flex flex-col items-center pt-8">
             <p className="text-muted">No additional runs found.</p>
             <Button
@@ -431,7 +520,7 @@ export function RunsPage({
             />
           </div>
         )}
-        {onRefresh && !error && (
+        {!progressiveSearch && onRefresh && !error && (
           <div className="flex flex-col items-center pt-2">
             <Button
               kind="secondary"

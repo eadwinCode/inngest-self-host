@@ -257,7 +257,7 @@ export const NewCodeBlock = ({
               <Pill
                 kind={header?.status === 'error' ? 'error' : 'default'}
                 appearance="outlined"
-                className="my-2 overflow-x-auto rounded-full p-3"
+                className="my-2 rounded-full p-3"
               >
                 <OptionalTooltip
                   tooltip={header.title.length && header.title.length > 55 ? header.title : ''}
@@ -440,15 +440,20 @@ export const NewCodeBlock = ({
                       </span>
                     )}
                   </code>
-                  {cursorPath && (
+                  {/* Always mounted, hidden via `invisible` instead of
+                      conditional rendering -- mounting it on the first
+                      cursor move resizes this bar, which resizes the
+                      editor (a flex sibling) mid-drag and permanently
+                      breaks Monaco's drag-selection tracking. */}
+                  <div className={cn(!cursorPath && 'invisible')}>
                     <CopyButton
                       size="small"
-                      code={cursorPath}
+                      code={cursorPath ?? ''}
                       isCopying={isPathCopying}
                       handleCopyClick={handlePathCopyClick}
                       appearance="outlined"
                     />
-                  )}
+                  </div>
                 </div>
               )}
             </div>
