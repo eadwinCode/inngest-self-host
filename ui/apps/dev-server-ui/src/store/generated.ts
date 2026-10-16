@@ -754,11 +754,21 @@ export type RunStepInfo = {
   type: Maybe<Scalars['String']>;
 };
 
+export type RunTraceConcurrencyKey = {
+  __typename?: 'RunTraceConcurrencyKey';
+  expression: Scalars['String'];
+  expressionTruncated: Scalars['Boolean'];
+  scope: Scalars['String'];
+  value: Scalars['String'];
+  valueTruncated: Scalars['Boolean'];
+};
+
 export type RunTraceSpan = {
   __typename?: 'RunTraceSpan';
   appID: Scalars['UUID'];
   attempts: Maybe<Scalars['Int']>;
   childrenSpans: Array<RunTraceSpan>;
+  customConcurrencyKeys: Array<RunTraceConcurrencyKey>;
   debugPaused: Scalars['Boolean'];
   debugRunID: Maybe<Scalars['ULID']>;
   debugSessionID: Maybe<Scalars['ULID']>;
