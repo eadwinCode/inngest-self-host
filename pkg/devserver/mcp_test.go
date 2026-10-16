@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/inngest/inngest/pkg/api/v2/apiv2endpoint"
+	"github.com/inngest/inngest/pkg/authn"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
 )
@@ -232,4 +233,35 @@ func listMCPTools(t *testing.T, handler http.Handler) []listedMCPTool {
 	}
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
 	return response.Result.Tools
+}
+
+// /mcp needs the signing key or a dashboard login once either is set; with
+// neither, as in local dev, it stays open.
+func TestMCPRouteIsOperatorOnly(t *testing.T) {
+	t.Setenv("INNGEST_HOST_EMAIL", "ops@example.com")
+	t.Setenv("INNGEST_HOST_PASSWORD", "pw")
+	key := "signkey-prod-0123456789abcdef"
+	initialize := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}`
+	call := func(r chi.Router, bearer string) int {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(initialize))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	locked := chi.NewRouter()
+	AddMCPRoute(locked.With(OperatorOnly(&key, authn.NewHostAuthConfig())), nil, nil, 0, nil)
+	require.Equal(t, http.StatusUnauthorized, call(locked, ""))
+	require.Equal(t, http.StatusUnauthorized, call(locked, "signkey-prod-wrong"))
+	require.NotEqual(t, http.StatusUnauthorized, call(locked, key))
+
+	t.Setenv("INNGEST_HOST_EMAIL", "")
+	open := chi.NewRouter()
+	AddMCPRoute(open.With(OperatorOnly(nil, authn.NewHostAuthConfig())), nil, nil, 0, nil)
+	require.NotEqual(t, http.StatusUnauthorized, call(open, ""))
 }

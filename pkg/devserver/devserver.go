@@ -752,7 +752,10 @@ func start(ctx context.Context, opts StartOpts) error {
 		return fmt.Errorf("failed to create v2 handler: %w", err)
 	}
 
-	AddMCPRoute(devAPI, ds.HandleEvent, ds.Data, opts.Tick, apiv2Handler)
+	// /mcp runs functions and sends events, and /debug is the Go profiler:
+	// both need the signing key or a dashboard login once either is set.
+	operatorOnly := OperatorOnly(opts.SigningKey, hostAuthConfig)
+	AddMCPRoute(devAPI.With(operatorOnly), ds.HandleEvent, ds.Data, opts.Tick, apiv2Handler)
 
 	// Create a new data API directly in the devserver.  This allows us to inject
 	// the data API into the dev server port, providing a single router for the dev
@@ -766,7 +769,7 @@ func start(ctx context.Context, opts StartOpts) error {
 		{At: "/v0", Router: core.Router},
 		{At: "/api/v2", Handler: apiv2Handler},
 		{At: "/v2", Handler: apiv2Handler},
-		{At: "/debug", Handler: middleware.Profiler()},
+		{At: "/debug", Handler: operatorOnly(middleware.Profiler())},
 		{At: "/metrics", Router: metricsAPI.Router},
 	}
 
