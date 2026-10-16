@@ -98,7 +98,7 @@ func TestV2Adapter(t *testing.T) {
 					RequestVersion:  1,
 					HasAI:           true,
 					ForceStepPlan:   true,
-					PriorityFactor:  int64Ptr(100),
+					PriorityFactor:  new(int64(100)),
 					CustomConcurrencyKeys: []statev2.CustomConcurrency{
 						{
 							Key:   "f:" + functionID.String() + ":user-123",
@@ -765,10 +765,6 @@ func TestV2AdapterWithDisabledRetries(t *testing.T) {
 	})
 }
 
-func int64Ptr(v int64) *int64 {
-	return &v
-}
-
 // mustV2Service spins up a miniredis, wires a sharded manager against it, and
 // returns the v2 RunService plus the miniredis handle for key inspection.
 func mustV2Service(t *testing.T, ctx context.Context) (statev2.RunService, *miniredis.Miniredis) {
@@ -1007,6 +1003,36 @@ func TestV2AdapterLookupIdempotency(t *testing.T) {
 	require.NotNil(t, entry)
 	assert.Equal(t, id.RunID, entry.RunID)
 	assert.True(t, entry.IsTombstone)
+}
+
+func TestV2AdapterLookupIdempotencyCleansUpOldMarkerOnlyTombstone(t *testing.T) {
+	ctx := context.Background()
+	svc, redis := mustV2Service(t, ctx)
+	id := statev2.ID{
+		RunID:      ulid.MustNew(ulid.Now(), rand.Reader),
+		FunctionID: uuid.New(),
+		Tenant: statev2.Tenant{
+			AccountID: uuid.New(),
+			EnvID:     uuid.New(),
+			AppID:     uuid.New(),
+		},
+	}
+	key := "old-marker-only-tombstone"
+	redisKey := fmt.Sprintf("{estate:%s}:key:%s", id.Tenant.AccountID, key)
+	require.NoError(t, redis.Set(redisKey, string(consts.FunctionIdempotencyTombstone)))
+
+	entry, err := svc.LookupIdempotency(ctx, id, key)
+	require.NoError(t, err)
+	assert.Nil(t, entry)
+	assert.False(t, redis.Exists(redisKey))
+
+	require.NoError(t, redis.Set(redisKey, string(consts.FunctionIdempotencyTombstone)))
+	redis.SetTTL(redisKey, time.Hour)
+	entry, err = svc.LookupIdempotency(ctx, id, key)
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.True(t, entry.IsTombstone)
+	assert.True(t, redis.Exists(redisKey))
 }
 
 // recordingPauseDeleter counts DeletePausesForRun calls for verifying

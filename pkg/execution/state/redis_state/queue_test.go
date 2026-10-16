@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -86,7 +85,7 @@ func TestQueueItemScore(t *testing.T) {
 					Kind: kind,
 					Identifier: state.Identifier{
 						RunID:          runID,
-						PriorityFactor: int64ptr(-60),
+						PriorityFactor: new(int64(-60)),
 					},
 				},
 			}
@@ -113,7 +112,7 @@ func TestQueueItemScore(t *testing.T) {
 				Kind: osqueue.KindSleep,
 				Identifier: state.Identifier{
 					RunID:          runID,
-					PriorityFactor: int64ptr(-60),
+					PriorityFactor: new(int64(-60)),
 				},
 			},
 		}
@@ -162,6 +161,51 @@ func TestQueueItemScore(t *testing.T) {
 			}
 			actual := item.Score(time.Now())
 			require.Equal(t, atMS, actual, kind)
+		})
+	}
+}
+
+func TestPartitionPeekLimit(t *testing.T) {
+	ctx := context.Background()
+	r := miniredis.RunT(t)
+	rc, err := rueidis.NewClient(rueidis.ClientOption{InitAddress: []string{r.Addr()}, DisableCache: true})
+	require.NoError(t, err)
+	t.Cleanup(rc.Close)
+	getterCalls := 0
+	_, shard := newQueue(t, rc, osqueue.WithPartitionPeekMaxGetter(func(context.Context, string) int64 {
+		getterCalls++
+		return 1
+	}))
+	accountID := uuid.New()
+	for range osqueue.AbsolutePartitionPeekMax + 1 {
+		functionID := uuid.New()
+		_, err := shard.EnqueueItem(ctx, osqueue.QueueItem{
+			FunctionID: functionID,
+			Data:       osqueue.Item{Identifier: state.Identifier{WorkflowID: functionID, AccountID: accountID}},
+		}, time.Now(), osqueue.EnqueueOpts{})
+		require.NoError(t, err)
+	}
+	until := time.Now().Add(time.Hour)
+	for _, tt := range []struct {
+		name      string
+		requested int64
+		want      int
+	}{
+		{name: "uses supplied limit above default", requested: 750, want: 750},
+		{name: "preserves per-account budget", requested: 5, want: 5},
+		{name: "zero uses default", requested: 0, want: int(osqueue.PartitionPeekMax)},
+		{name: "negative uses default", requested: -1, want: int(osqueue.PartitionPeekMax)},
+		{name: "absolute cap", requested: osqueue.AbsolutePartitionPeekMax + 1, want: int(osqueue.AbsolutePartitionPeekMax)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			items, err := shard.PartitionPeek(ctx, false, until, tt.requested)
+			require.NoError(t, err)
+			require.Len(t, items, tt.want)
+			require.Zero(t, getterCalls, "PartitionPeek must not re-evaluate the scanner's limit")
+			items, err = shard.PeekAccountPartitions(ctx, accountID, tt.requested, until, false)
+			require.NoError(t, err)
+			require.Len(t, items, tt.want)
+			require.Zero(t, getterCalls, "PeekAccountPartitions must not re-evaluate the scanner's limit")
 		})
 	}
 }
@@ -548,49 +592,6 @@ func TestQueueEnqueueItem(t *testing.T) {
 		})
 	})
 
-	t.Run("Migrates old partitions to add accountId", func(t *testing.T) {
-		r.FlushAll()
-
-		id := uuid.MustParse("baac957a-3aa5-4e42-8c1d-f86dee5d58da")
-		envId := uuid.MustParse("e8c0aacd-fcb4-4d5a-b78a-7f0528841543")
-
-		oldPartitionSnapshot := "{\"at\":1723814830,\"p\":6,\"wsID\":\"e8c0aacd-fcb4-4d5a-b78a-7f0528841543\",\"wid\":\"baac957a-3aa5-4e42-8c1d-f86dee5d58da\",\"last\":1723814800026,\"forceAtMS\":0,\"off\":false}"
-
-		r.HSet(shard.Client().kg.PartitionItem(), id.String(), oldPartitionSnapshot)
-		assert.Equal(t, osqueue.QueuePartition{
-			FunctionID: &id,
-			EnvID:      &envId,
-			// No accountId is present,
-			AccountID: uuid.UUID{},
-			LeaseID:   nil,
-			Last:      1723814800026,
-		}, getPartition(t, r, enums.PartitionTypeDefault, id))
-
-		item, err := shard.EnqueueItem(ctx, osqueue.QueueItem{
-			FunctionID: id,
-			Data: osqueue.Item{
-				Identifier: state.Identifier{
-					AccountID: accountId,
-				},
-			},
-		}, start, osqueue.EnqueueOpts{})
-		require.NoError(t, err)
-		require.NotEqual(t, item.ID, ulid.Zero)
-		require.WithinDuration(t,
-			time.UnixMilli(item.WallTimeMS),
-			start,
-			1500*time.Millisecond,
-		)
-
-		assert.Equal(t, osqueue.QueuePartition{
-			FunctionID: &id,
-			EnvID:      &envId,
-			// No accountId is present,
-			AccountID: accountId,
-			LeaseID:   nil,
-			Last:      1723814800026,
-		}, getPartition(t, r, enums.PartitionTypeDefault, id), r.Dump())
-	})
 }
 
 func TestQueueEnqueueItemIdempotency(t *testing.T) {
@@ -2265,30 +2266,6 @@ func partitionIsMissingInHash(t *testing.T, r *miniredis.Miniredis, pType enums.
 	require.NotContains(t, val, key, "expected partition to be missing")
 }
 
-func getPartition(t *testing.T, r *miniredis.Miniredis, pType enums.PartitionType, id uuid.UUID, optionalHash ...string) osqueue.QueuePartition {
-	t.Helper()
-	hash := ""
-	if len(optionalHash) > 0 {
-		hash = optionalHash[0]
-	}
-	kg := &queueKeyGenerator{queueDefaultKey: QueueDefaultKey}
-
-	key := kg.PartitionQueueSet(pType, id.String(), hash)
-	if pType == enums.PartitionTypeDefault {
-		key = id.String()
-	}
-
-	val := r.HGet(kg.PartitionItem(), key)
-
-	items, _ := r.HKeys(kg.PartitionItem())
-
-	require.NotEmpty(t, val, "couldn't find partition in map with key:\n--> %s\nhave:\n%v", key, strings.Join(items, "\n"))
-	qp := osqueue.QueuePartition{}
-	err := json.Unmarshal([]byte(val), &qp)
-	require.NoError(t, err)
-	return qp
-}
-
 func requireItemScoreEquals(t *testing.T, r *miniredis.Miniredis, item osqueue.QueueItem, expected time.Time) {
 	t.Helper()
 	kg := &queueKeyGenerator{queueDefaultKey: QueueDefaultKey}
@@ -2412,8 +2389,6 @@ func createConcurrencyKey(scope enums.ConcurrencyScope, scopeID uuid.UUID, value
 		UnhashedEvaluatedKeyValue: value,
 	}
 }
-
-func int64ptr(i int64) *int64 { return &i }
 
 func TestQueueEnqueueToBacklog(t *testing.T) {
 	t.Run("simple item", func(t *testing.T) {

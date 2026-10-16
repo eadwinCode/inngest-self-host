@@ -31,6 +31,15 @@ func IncrQueueItemProcessedCounter(ctx context.Context, opts CounterOpt) {
 	})
 }
 
+func IncrQueueArchivedWorkspaceAppSemaphoreBypassCounter(ctx context.Context, opts CounterOpt) {
+	RecordCounterMetric(ctx, 1, CounterOpt{
+		PkgName:     opts.PkgName,
+		MetricName:  "queue_archived_workspace_app_semaphore_bypass_total",
+		Description: "Total app semaphore checks bypassed to drain archived workspace queue items",
+		Tags:        opts.Tags,
+	})
+}
+
 func IncrQueueItemEarliestPeekTimeCounter(ctx context.Context, count int64, opts CounterOpt) {
 	RecordCounterMetric(ctx, count, CounterOpt{
 		PkgName:     opts.PkgName,
@@ -354,6 +363,33 @@ func IncrConnectGatewayGRPCReplyCounter(ctx context.Context, value int64, opts C
 		PkgName:     opts.PkgName,
 		MetricName:  "connect_gateway.grpc.reply_total",
 		Description: "Total number of replies coming from connect gateways to executors",
+		Tags:        opts.Tags,
+	})
+}
+
+func IncrConnectGatewayGRPCExecutorReplyFailureCounter(ctx context.Context, value int64, opts CounterOpt) {
+	RecordCounterMetric(ctx, value, CounterOpt{
+		PkgName:     opts.PkgName,
+		MetricName:  "connect_gateway.grpc.executor_reply_failure_total",
+		Description: "Total number of failures sending replies from connect gateways to executors via gRPC",
+		Tags:        opts.Tags,
+	})
+}
+
+func IncrConnectGatewayResponseBufferWriteCounter(ctx context.Context, value int64, opts CounterOpt) {
+	RecordCounterMetric(ctx, value, CounterOpt{
+		PkgName:     opts.PkgName,
+		MetricName:  "connect_gateway.response_buffer.write_total",
+		Description: "Total number of connect gateway response buffer writes",
+		Tags:        opts.Tags,
+	})
+}
+
+func IncrConnectProxyResponseBufferReadCounter(ctx context.Context, value int64, opts CounterOpt) {
+	RecordCounterMetric(ctx, value, CounterOpt{
+		PkgName:     opts.PkgName,
+		MetricName:  "connect_proxy.response_buffer.read_total",
+		Description: "Total number of connect proxy response buffer hits and read errors",
 		Tags:        opts.Tags,
 	})
 }

@@ -1,28 +1,84 @@
 import { getPeriodAbbreviation } from '@inngest/components/utils/date';
+import * as Sentry from '@sentry/tanstackstart-react';
 
 import type {
   BillingPlan,
-  EntitlementConcurrency,
+  EntitlementConcurrencyValue,
   EntitlementInt,
-  EntitlementRunCount,
+  EntitlementWithOverage,
+  GetPlansQuery,
 } from '@/gql/graphql';
 import { pathCreator } from '@/utils/urls';
 
 export type Plan = Omit<
   BillingPlan,
-  'entitlements' | 'features' | 'availableAddons' | 'addons'
+  'entitlements' | 'ents' | 'features' | 'availableAddons' | 'addons'
 > & {
   entitlements: {
-    concurrency: Pick<EntitlementConcurrency, 'limit'>;
-    runCount: Pick<EntitlementRunCount, 'limit'>;
+    concurrency: Pick<EntitlementConcurrencyValue, 'limit'>;
+    executions?: Pick<EntitlementWithOverage, 'limit'>;
+    runCount: Pick<EntitlementWithOverage, 'limit'>;
     history: Pick<EntitlementInt, 'limit'>;
   };
 };
+
+export type SelfServePlan = GetPlansQuery['plans'][number];
+
+// the billing API does not guarantee one active plan per name.  each card
+// needs one plan so checkout has one price.
+export function pickSelfServePlans(plans?: SelfServePlan[]): {
+  hobby: SelfServePlan | null;
+  pro: SelfServePlan | null;
+  growth: SelfServePlan | null;
+} {
+  const selectablePlans = plans ?? [];
+
+  // Multiple matches indicate that an old plan was not retired correctly, so
+  // report that via Sentry. Keep checkout available by picking a plan arbitrarily.
+  const pickPlan = (name: string, isFree: boolean) => {
+    const candidates = selectablePlans.filter(
+      (plan) => plan.isFree === isFree && !plan.isLegacy && plan.name === name,
+    );
+
+    if (candidates.length > 1) {
+      Sentry.captureMessage(
+        `Multiple active, visible ${name} billing plans returned`,
+        {
+          level: 'error',
+          extra: {
+            plans: candidates.map(({ amount, slug }) => ({ amount, slug })),
+          },
+        },
+      );
+    }
+
+    if (plans && candidates.length === 0) {
+      Sentry.captureMessage(`Missing active, visible ${name} billing plan`, {
+        level: 'error',
+      });
+    }
+
+    return candidates.reduce<SelfServePlan | null>(
+      (selected, candidate) =>
+        !selected || candidate.amount > selected.amount ? candidate : selected,
+      null,
+    );
+  };
+
+  const selfServePlans = {
+    hobby: pickPlan('Hobby', true),
+    pro: pickPlan('Pro', false),
+    growth: pickPlan('Growth', false),
+  };
+
+  return selfServePlans;
+}
 
 export enum PlanNames {
   Free = 'Free Tier',
   Basic = 'Basic',
   Pro = 'Pro',
+  Growth = 'Growth',
   Hobby = 'Hobby - Free',
   Enterprise = 'Enterprise',
 }
@@ -61,13 +117,13 @@ function getFeatureDescriptions(
     notation: 'compact',
     compactDisplay: 'short',
   });
+  const executionLimit = entitlements.executions?.limit;
+  const runLimit = executionLimit ?? entitlements.runCount.limit;
 
   switch (planName) {
     case PlanNames.Free:
       return [
-        ...(entitlements.runCount.limit
-          ? [`${numberFormatter.format(entitlements.runCount.limit)} runs/mo`]
-          : []),
+        ...(runLimit ? [`${numberFormatter.format(runLimit)} runs/mo`] : []),
         `${numberFormatter.format(
           entitlements.concurrency.limit,
         )} concurrent steps`,
@@ -79,12 +135,8 @@ function getFeatureDescriptions(
 
     case PlanNames.Basic:
       return [
-        ...(entitlements.runCount.limit
-          ? [
-              `Starts at ${numberFormatter.format(
-                entitlements.runCount.limit,
-              )} runs/mo`,
-            ]
+        ...(runLimit
+          ? [`Starts at ${numberFormatter.format(runLimit)} runs/mo`]
           : []),
         `Starts at ${numberFormatter.format(
           entitlements.concurrency.limit,
@@ -137,10 +189,16 @@ function getFeatureDescriptions(
         'Community support',
       ];
 
+    // "runs/mo" is legacy copy, but we still need to support users whose
+    // current plan predates execution-based billing.
     default:
       return [
-        ...(entitlements.runCount.limit
-          ? [`${numberFormatter.format(entitlements.runCount.limit)} runs/mo`]
+        ...(runLimit
+          ? [
+              executionLimit == null
+                ? `${numberFormatter.format(runLimit)} runs/mo`
+                : `${executionLimit.toLocaleString('en-US')} executions`,
+            ]
           : []),
         `${numberFormatter.format(
           entitlements.concurrency.limit,

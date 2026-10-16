@@ -19,10 +19,12 @@ import (
 	"time"
 	"unicode"
 
+	cliauth "github.com/inngest/inngest/cmd/internal/auth"
 	localconfig "github.com/inngest/inngest/cmd/internal/config"
 	"github.com/inngest/inngest/pkg/api"
 	"github.com/inngest/inngest/pkg/api/tel"
 	"github.com/inngest/inngest/pkg/api/v2/apiv2endpoint"
+	"github.com/inngest/inngest/pkg/inngest/version"
 	"github.com/urfave/cli/v3"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
@@ -149,12 +151,11 @@ func commonFlags() []cli.Flag {
 			Category: "Auth",
 			Name:     "signing-key",
 			Usage:    "Signing key sent as a Bearer token",
-			Sources:  cli.EnvVars("INNGEST_SIGNING_KEY"),
 		},
 		&cli.StringFlag{
 			Category: "Auth",
 			Name:     "env",
-			Usage:    "Environment name sent as X-Inngest-Env",
+			Usage:    "Environment slug; required for environment-specific requests with all-environment credentials",
 			Sources:  cli.EnvVars("INNGEST_ENV"),
 		},
 		&cli.DurationFlag{
@@ -348,7 +349,7 @@ func endpointDescription(ep endpoint) string {
 		"  --api-host, --api-port  Target a custom API server; host may include /api/v2 or /v2",
 		"  --api-key               API key, or INNGEST_API_KEY",
 		"  --signing-key           Signing key, or INNGEST_SIGNING_KEY",
-		"  --env                   Environment name, or INNGEST_ENV",
+		"  --env                   Environment slug or INNGEST_ENV; required for environment-specific requests with all-environment credentials",
 		"  --raw                   Print the response body without formatting",
 		"",
 		"Authentication: https://api-docs.inngest.com/authentication",
@@ -375,7 +376,7 @@ func callEndpoint(ctx context.Context, cmd *cli.Command, ep endpoint) error {
 	if ep.streaming && !cmd.IsSet("timeout") {
 		timeout = 0
 	}
-	client := &http.Client{Timeout: timeout}
+	client := &http.Client{Timeout: timeout, CheckRedirect: checkAPIRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		if req.URL.Scheme+"://"+req.URL.Host == defaultDevServerOrigin {
@@ -392,6 +393,9 @@ func callEndpoint(ctx context.Context, cmd *cli.Command, ep endpoint) error {
 		}
 		if int64(len(body)) > maxResponseBytes {
 			return fmt.Errorf("response body exceeded %d bytes", maxResponseBytes)
+		}
+		if resp.StatusCode == http.StatusUnauthorized && req.Header.Get("Authorization") == "" {
+			return errors.New("Authentication required. Log into Inngest Cloud with:\n\ninngest login\n\nor\n\nnpx inngest-cli@latest login\n\nor provide an API key\n")
 		}
 		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
@@ -478,8 +482,9 @@ func buildRequest(ctx context.Context, cmd *cli.Command, ep endpoint) (*http.Req
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "inngest-cli/"+version.Version)
 
-	if token, err := authToken(cmd); err != nil {
+	if token, err := authToken(ctx, cmd, baseURL); err != nil {
 		return nil, err
 	} else if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -496,7 +501,14 @@ func buildRequest(ctx context.Context, cmd *cli.Command, ep endpoint) (*http.Req
 	return req, nil
 }
 
-// don't ship credentials to a non-local host over http
+func checkAPIRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	return guardPlaintextAuth(req)
+}
+
+// never send credentials over remote http
 func guardPlaintextAuth(req *http.Request) error {
 	if req.Header.Get("Authorization") == "" {
 		return nil
@@ -888,11 +900,23 @@ func parseTimestamp(value string) (string, error) {
 	return value, nil
 }
 
-func authToken(cmd *cli.Command) (string, error) {
+func authToken(ctx context.Context, cmd *cli.Command, resource string) (string, error) {
 	if apiKey := cmd.String("api-key"); apiKey != "" {
 		return apiKey, nil
 	}
-	return cmd.String("signing-key"), nil
+	// an explicit key overrides the stored login
+	if signingKey := cmd.String("signing-key"); signingKey != "" {
+		return signingKey, nil
+	}
+	manager, err := cliauth.NewManager()
+	if err != nil {
+		return "", err
+	}
+	token, _, err := manager.AccessToken(ctx, resource)
+	if errors.Is(err, cliauth.ErrNotLoggedIn) {
+		return os.Getenv("INNGEST_SIGNING_KEY"), nil
+	}
+	return token, err
 }
 
 func addQueryValue(values url.Values, key string, value any) {

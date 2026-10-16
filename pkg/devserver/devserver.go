@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"time"
@@ -123,6 +124,10 @@ type StartOpts struct {
 	// EventKey is used to authorize incoming events, ensuring they match the
 	// given key.
 	EventKeys []string `json:"-"`
+
+	// CloudSandboxes optionally handles authenticated Cloud compute requests.
+	// Local events, functions, runs, and executor state are never forwarded.
+	CloudSandboxes http.Handler `json:"-"`
 
 	// RequireKeys defines whether event and signing keys are required for the
 	// server to function. If this is true and signing keys are not defined,
@@ -459,6 +464,11 @@ func start(ctx context.Context, opts StartOpts) error {
 	// automatically transform dev requests to lambda invocations.
 	//
 	// We also make sure to allow local requests.
+	url := opts.Config.CoreAPI.Addr
+	if url == "0.0.0.0" {
+		url = "127.0.0.1"
+	}
+	publishURL := fmt.Sprintf("http://%s:%d/v1/realtime/publish", url, opts.Config.CoreAPI.Port)
 	httpClient := exechttp.Client(
 		exechttp.SecureDialerOpts{
 			AllowHostDocker: true, // In local dev, this is OK
@@ -467,7 +477,7 @@ func start(ctx context.Context, opts StartOpts) error {
 		},
 		// Enable publishing of any requests made directly from the dev server.  Note that this
 		// is different from the cloud.
-		exechttp.WithRealtimePublishing(),
+		exechttp.WithDevServerRealtimePublishing(publishURL),
 	)
 
 	httpClient.Client.Transport = awsgateway.NewTransformTripper(httpClient.Client.Transport)
@@ -493,11 +503,6 @@ func start(ctx context.Context, opts StartOpts) error {
 	}
 
 	tp := tracing.NewSqlcTracerProvider(adapter.Q())
-
-	url := opts.Config.CoreAPI.Addr
-	if url == "0.0.0.0" {
-		url = "127.0.0.1"
-	}
 
 	executorOpts := []executor.ExecutorOpt{
 		executor.WithHTTPClient(httpClient),
@@ -558,13 +563,10 @@ func start(ctx context.Context, opts StartOpts) error {
 		executor.WithTraceReader(dbcqrs),
 		executor.WithRealtimeConfig(executor.ExecutorRealtimeConfig{
 			Secret:     consts.DevServerRealtimeJWTSecret,
-			PublishURL: fmt.Sprintf("http://%s:%d/v1/realtime/publish", url, opts.Config.CoreAPI.Port),
+			PublishURL: publishURL,
 		}),
 		executor.WithTracerProvider(tp),
 
-		executor.WithAllowStepMetadata(func(ctx context.Context, acctID uuid.UUID) bool {
-			return enableStepMetadata
-		}),
 		executor.WithCapacityManager(cm),
 		executor.WithSemaphoreManager(semaphores),
 		executor.WithUseConstraintAPI(func(ctx context.Context, accountID uuid.UUID) (enable bool) {
@@ -665,7 +667,10 @@ func start(ctx context.Context, opts StartOpts) error {
 			CachingMiddleware: caching,
 			FunctionReader:    ds.Data,
 			Executor:          ds.Executor,
-			Queue:             rq,
+			QueueProducer:     rq,
+			RunQueueReader:    rq,
+			QueueItemReader:   rq,
+			AttemptResetter:   rq,
 			QueueShards:       shardRegistry,
 			Broadcaster:       broadcaster,
 			TraceReader:       ds.Data,
@@ -681,9 +686,6 @@ func start(ctx context.Context, opts StartOpts) error {
 				RunOutputReader: devutil.NewLocalOutputReader(core.Resolver(), ds.Data, ds.Data),
 				RunJWTSecret:    consts.DevServerRunJWTSecret,
 				BackoffFunc:     retryBackoff,
-				AllowStepMetadata: func(ctx context.Context, acctID uuid.UUID) bool {
-					return enableStepMetadata
-				},
 				AllowAsyncDispatchValidation: func(ctx context.Context, acctID uuid.UUID) bool {
 					return enableAsyncDispatchValidation
 				},
@@ -731,6 +733,9 @@ func start(ctx context.Context, opts StartOpts) error {
 		FunctionTraces:      NewFunctionTraceReader(dbcqrs),
 		Executor:            exec,
 		EventPublisher:      runner,
+		EventSender: func(ctx context.Context, evt *event.Event) (string, error) {
+			return ds.HandleEvent(ctx, evt, nil)
+		},
 		Scores: apiv2.NewStateScoreProvider(apiv2.StateScoreProviderOptions{
 			State:          smv2,
 			TracerProvider: tp,
@@ -755,7 +760,8 @@ func start(ctx context.Context, opts StartOpts) error {
 	// /mcp runs functions and sends events, and /debug is the Go profiler:
 	// both need the signing key or a dashboard login once either is set.
 	operatorOnly := OperatorOnly(opts.SigningKey, hostAuthConfig)
-	AddMCPRoute(devAPI.With(operatorOnly), ds.HandleEvent, ds.Data, opts.Tick, apiv2Handler)
+	mcpHandler := newMCPHandler(ds.HandleEvent, ds.Data, opts.Tick, apiv2Handler)
+	addMCPRoute(devAPI.With(operatorOnly), mcpHandler)
 
 	// Create a new data API directly in the devserver.  This allows us to inject
 	// the data API into the dev server port, providing a single router for the dev
@@ -767,10 +773,18 @@ func start(ctx context.Context, opts StartOpts) error {
 	mounts := []api.Mount{
 		{At: "/", Router: devAPI},
 		{At: "/v0", Router: core.Router},
+		{At: "/api/v2/operations", Handler: http.HandlerFunc(mcpHandler.Operations)},
+		{At: "/v2/operations", Handler: http.HandlerFunc(mcpHandler.Operations)},
 		{At: "/api/v2", Handler: apiv2Handler},
 		{At: "/v2", Handler: apiv2Handler},
 		{At: "/debug", Handler: operatorOnly(middleware.Profiler())},
 		{At: "/metrics", Router: metricsAPI.Router},
+	}
+
+	if opts.CloudSandboxes != nil {
+		for _, path := range []string{"/dev/cloud", "/v2/sandboxes", "/v2/snapshots", "/api/v2/sandboxes", "/api/v2/snapshots"} {
+			mounts = append(mounts, api.Mount{At: path, Handler: opts.CloudSandboxes})
+		}
 	}
 
 	if testapi.ShouldEnable() {
@@ -815,7 +829,10 @@ func start(ctx context.Context, opts StartOpts) error {
 		services = append(services, debugapi.NewDebugAPI(debugapi.Opts{
 			Log:              l,
 			DB:               ds.Data,
-			QueueReader:      rq,
+			RunReader:        rq,
+			ItemReader:       rq,
+			PartitionReader:  rq,
+			BacklogReader:    rq,
 			State:            ds.State,
 			Cron:             croner,
 			ShardRegistry:    shardRegistry,

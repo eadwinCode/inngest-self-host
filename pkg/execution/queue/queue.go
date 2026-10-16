@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"iter"
 	"time"
 
+	"github.com/inngest/inngest/pkg/constraintapi"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -14,7 +14,11 @@ type Queue interface {
 	Producer
 	Consumer
 
-	JobQueueReader
+	RunQueueReader
+	QueueStatusReader
+	QueuePartitionReader
+	QueueBacklogReader
+	QueueItemReader
 	MigrationLocker
 	Unpauser
 	AttemptResetter
@@ -58,6 +62,9 @@ type LeaseItemRequest struct {
 	ContinueCount              uint
 	EarliestPeekTimeFallbackMS int64
 	StaticTime                 time.Time
+	// SkipRequeueOnLimit leaves a constraint-limited item where it is instead of
+	// requeueing the caller's copy. Direct hints set it: their copy may be stale.
+	SkipRequeueOnLimit bool
 }
 
 type LeaseItemStatus int
@@ -74,12 +81,16 @@ const (
 	LeaseItemStatusNotFound
 	LeaseItemStatusLeaseContention
 	LeaseItemStatusLeaseError
+	LeaseItemStatusDropped
 )
 
 type LeaseItemResult struct {
 	Status     LeaseItemStatus
 	Err        error
 	RetryAfter time.Time
+	// ExhaustedSemaphores lists the semaphores that had no capacity for this item.
+	// the iterator uses it to skip later items that carry the same semaphore.
+	ExhaustedSemaphores []constraintapi.SemaphoreConstraint
 }
 
 type RunResult struct {
@@ -93,6 +104,10 @@ type ProcessItemResult struct {
 }
 
 type EnqueueOpts struct {
+	// OnEnqueued optionally observes the finalized item and selected shard after
+	// durable enqueue succeeds. It runs synchronously; observers must not block.
+	// Queue proxies carry the result back to the caller, not the callback itself.
+	OnEnqueued             func(QueueItem, string) `json:"-"`
 	PassthroughJobId       bool
 	ForceQueueShardName    string
 	NormalizeFromBacklogID string
@@ -263,49 +278,56 @@ type JobResponse struct {
 	Raw any
 }
 
-// JobQueueReader
-type JobQueueReader interface {
+// RunQueueReader reads queue state associated with function runs.
+type RunQueueReader interface {
 	// OutstandingJobCount returns the number of jobs in progress
 	// or scheduled for a given run.
 	OutstandingJobCount(ctx context.Context, scope Scope, runID ulid.ULID) (int, error)
 
+	// RunJobs reads items in the queue for a specific run.
+	RunJobs(ctx context.Context, queueShardName string, scope Scope, runID ulid.ULID, limit, offset int64) ([]JobResponse, error)
+
+	// ItemsByRunID retrieves all queue items via runID.
+	ItemsByRunID(ctx context.Context, queueShard QueueShard, scope Scope, runID ulid.ULID) ([]*QueueItem, error)
+}
+
+// QueueStatusReader reads function-level queue status counters.
+type QueueStatusReader interface {
 	// RunningCount returns the number of running (in-progress) jobs for a given function
 	RunningCount(ctx context.Context, scope Scope) (int64, error)
 
 	// StatusCount returns the total number of items in the function
 	// status queue.
 	StatusCount(ctx context.Context, scope Scope, status string) (int64, error)
+}
 
+// QueuePartitionReader reads partition state and items.
+type QueuePartitionReader interface {
+	// PartitionSize returns the point-in-time ready queue size of a partition.
+	PartitionSize(ctx context.Context, scope Scope, partitionID string, until time.Time) (int64, error)
+
+	// PartitionByID retrieves the partition by the partition ID
+	PartitionByID(ctx context.Context, queueShard QueueShard, scope Scope, partitionID string) (*PartitionInspectionResult, error)
+}
+
+// QueueBacklogReader reads key-queue backlog state. Shards that do not support
+// key queues are not required to implement the corresponding BacklogOperations.
+type QueueBacklogReader interface {
 	// PartitionBacklogSize returns the point-in-time backlog size of a partition
 	// by summing the size of all backlogs in that partition.
 	PartitionBacklogSize(ctx context.Context, scope Scope, partitionID string) (int64, error)
 
-	// PartitionSize returns the point-in-time ready queue size of a partition.
-	PartitionSize(ctx context.Context, scope Scope, partitionID string, until time.Time) (int64, error)
-
-	// RunJobs reads items in the queue for a specific run.
-	RunJobs(ctx context.Context, queueShardName string, scope Scope, runID ulid.ULID, limit, offset int64) ([]JobResponse, error)
-
-	// ItemsByPartition returns a queue item iterator for a function within a specific time range
-	ItemsByPartition(ctx context.Context, queueShard QueueShard, scope Scope, partitionID string, from time.Time, until time.Time, opts ...QueueIterOpt) (iter.Seq[*QueueItem], error)
-	// ItemsByBacklog returns a queue item iterator for a backlog within a specific time range
-	ItemsByBacklog(ctx context.Context, queueShard QueueShard, backlogID string, from time.Time, until time.Time, opts ...QueueIterOpt) (iter.Seq[*QueueItem], error)
-	// BacklogsByPartition returns an iterator for the partition's backlogs
-	BacklogsByPartition(ctx context.Context, queueShard QueueShard, partitionID string, from time.Time, until time.Time, opts ...QueueIterOpt) (iter.Seq[*QueueBacklog], error)
 	// BacklogSize retrieves the number of items in the specified backlog
 	BacklogSize(ctx context.Context, queueShard QueueShard, backlogID string) (int64, error)
 	// BacklogByID retrieves a single backlog by its ID
 	BacklogByID(ctx context.Context, queueShard QueueShard, backlogID string) (*QueueBacklog, error)
-	// PartitionByID retrieves the partition by the partition ID
-	PartitionByID(ctx context.Context, queueShard QueueShard, scope Scope, partitionID string) (*PartitionInspectionResult, error)
+}
+
+// QueueItemReader reads individual queue items.
+type QueueItemReader interface {
 	// LoadQueueItem retrieves the queue item by the item ID.
 	LoadQueueItem(ctx context.Context, shardName string, itemID string) (*QueueItem, error)
 
 	// ItemExists checks if an item with jobID exists in the queue
 	ItemExists(ctx context.Context, queueShard QueueShard, scope Scope, jobID string) (bool, error)
-	// ItemsByRunID retrieves all queue items via runID
-	//
-	// NOTE
-	// The queue technically shouldn't know about runIDs, so we should make this more generic with certain type of indices in the future
-	ItemsByRunID(ctx context.Context, queueShard QueueShard, scope Scope, runID ulid.ULID) ([]*QueueItem, error)
 }
