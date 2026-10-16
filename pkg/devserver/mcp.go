@@ -20,6 +20,7 @@ import (
 	"github.com/inngest/inngest/pkg/api/tel"
 	"github.com/inngest/inngest/pkg/api/v2/apiv2endpoint"
 	"github.com/inngest/inngest/pkg/api/v2/apiv2mcp"
+	"github.com/inngest/inngest/pkg/authn"
 	"github.com/inngest/inngest/pkg/consts"
 	"github.com/inngest/inngest/pkg/cqrs"
 	"github.com/inngest/inngest/pkg/event"
@@ -1174,6 +1175,13 @@ func (h *MCPHandler) listDocs(ctx context.Context, req *mcp.CallToolRequest, _ s
 			},
 		},
 	}, result, nil
+}
+
+// OperatorOnly lets a request through with the signing key (a bearer token)
+// or a dashboard login cookie. With neither configured, as in local dev, it
+// lets everything through.
+func OperatorOnly(signingKey *string, hostAuth *authn.HostAuthConfig) func(http.Handler) http.Handler {
+	return authn.SigningKeyOrHostAuthMiddleware(authn.SigningKeyMiddleware(signingKey), hostAuth)
 }
 
 // AddMCPRoute adds the MCP route to the dev server router
